@@ -12,7 +12,7 @@ import pytesseract
 # ──────────────────────────────────────────────────────────────────────────────
 # App & versión
 # ──────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AutoCatastro AI", version="0.6.7"  # PATCH: actualizada por integración de casos límite 02–07)
+app = FastAPI(title="AutoCatastro AI", version="0.6.7")  # PATCH: actualizada por integración de casos límite 02–07)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flags de entorno / seguridad
