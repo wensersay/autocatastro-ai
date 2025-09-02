@@ -1,5 +1,11 @@
 fastapi
-uvicorn[standard]
-python-multipart
+uvicorn
+pdf2image
+Pillow
+opencv-python-headless
+requests
+python-dotenv
 PyMuPDF
 openai
+pytesseract
+python-multipart
