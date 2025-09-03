@@ -1,12 +1,10 @@
 fastapi
 uvicorn
-pydantic
-python-multipart
+pytesseract
 pdf2image
-pillow
 opencv-python-headless
 numpy
-PyMuPDF
-python-docx
-reportlab
-pytesseract
+pillow
+python-multipart
+openai
+python-jose
