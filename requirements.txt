@@ -8,3 +8,4 @@ python-multipart
 PyMuPDF
 python-dotenv
 aiofiles
+pytesseract
