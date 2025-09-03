@@ -1,5 +1,19 @@
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Header, Depends
+
+from fastapi import Request
+
+AUTH_TOKEN = os.environ.get("AUTH_TOKEN")
+
+def check_auth(request: Request):
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Authorization header missing or malformed")
+
+    token = auth_header.split("Bearer ")[1]
+    if token != AUTH_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
