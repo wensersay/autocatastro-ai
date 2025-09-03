@@ -1,11 +1,11 @@
 fastapi
 uvicorn
+python-multipart
+pytesseract
 pdf2image
 Pillow
 opencv-python-headless
-requests
-python-dotenv
-PyMuPDF
+numpy
+python-docx
+PyMuPDF==1.22.0
 openai
-pytesseract
-python-multipart
