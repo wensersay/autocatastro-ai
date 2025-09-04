@@ -1,82 +1,62 @@
 """
-app.py — autoCata v0.7.2
-Pipeline real: OCR con Tesseract + extracción visual de colindantes + redacción notarial (GPT-4o)
+app.py — autoCata v0.7.3 (todo-en-uno)
+OCR con Tesseract + extracción visual (color y fallback por texto) + redacción notarial (GPT-4o)
 
 ▶ Endpoints
-- POST /extract  → procesa 1..5 PDFs de certificaciones catastrales (secuencial)
+- POST /extract → procesa 1..5 PDFs de certificaciones catastrales (secuencial)
 
-▶ Requisitos del entorno (Railway / local)
-- Python 3.9+
-- Paquetes pip:
+▶ Dependencias (pip)
   fastapi, uvicorn, pydantic, python-multipart, pillow, pdf2image, pytesseract,
   opencv-python-headless, numpy, openai (>=1.40), python-dotenv (opcional)
-- Sistema: tesseract-ocr instalado en el host (apt-get install tesseract-ocr)
-- Poppler para pdf2image (apt-get install poppler-utils)
 
-▶ Variables de entorno relevantes (todas opcionales salvo AUTH_TOKEN y OPENAI_API_KEY si se usa GPT)
-- AUTH_TOKEN                        → token fijo para Authorization: Bearer <token>
-- OPENAI_API_KEY                    → API key de OpenAI (GPT-4o)
-- MODEL_NOTARIAL                    → por defecto "gpt-4o-mini"
-- PDF_DPI                           → por defecto 300
-- FAST_MODE                         → "1" para usar umbrales rápidos
-- TEXT_ONLY                         → "1" para saltar CV y sólo extraer texto (respaldo)
-- NAME_HINTS                        → lista separada por | con pistas de nombres
-- NAME_HINTS_FILE                   → ruta a fichero con pistas de nombres (una por línea)
-- SECOND_LINE_FORCE                 → "1" fuerza concatenación 2ª línea del nombre
-- SECOND_LINE_MAXCHARS              → por defecto 28
-- SECOND_LINE_MAXTOKENS             → por defecto 5
-- SECOND_LINE_STRICT                → "1" activa heurística estricta
-- NEIGH_MIN_AREA_HARD               → área mínima de contorno vecino (px) (p.ej. 1800)
-- SIDE_MAX_DIST_FRAC                → fracción máx. de distancia para asignación a cardinal (0..1)
-- ROW_BAND_FRAC                     → fracción de banda superior/inferior para Norte/Sur (fallback)
-- NEIGH_MAX_DIST_RATIO              → ratio de distancia para filtrar cartelas lejanas (por defecto 1.4)
-- AUTO_DPI, FAST_DPI, SLOW_DPI      → perfiles opcionales de DPI
-- DIAG_MODE                         → "1" adjunta datos debug (cajas, puntos, etc.)
-- REORDER_TO_NOMBRE_APELLIDOS       → "1" reordena a Nombre Apellidos si detecta "APELLIDOS, NOMBRE"
-- REORDER_MIN_CONF                  → confianza mínima OCR 0..100 para reordenar
+▶ Sistema
+- tesseract-ocr (+ idioma spa)
+- poppler-utils
 
-▶ Cumplimiento de requisitos marcados por el usuario (2025-09-03)
-1) Redacción notarial en JSON (campo notarial_text) y además como archivo .txt descargable
-2) Si el PDF no contiene OCR/metadata legibles → error 400 explicando el motivo
-3) Todo gestionado desde /extract; límite 5 PDFs por subida; procesamiento secuencial
-4) Uso exclusivo de GPT-4o para redacción notarial (si hay API key); plantilla local si no
-5) Integración con tokens fijos (Bearer AUTH_TOKEN) para WordPress plugin
-
+▶ Variables de entorno más útiles
+- AUTH_TOKEN                        (Bearer)
+- OPENAI_API_KEY                    (GPT-4o)
+- MODEL_NOTARIAL                    (por defecto "gpt-4o-mini")
+- PDF_DPI                           (por defecto 300; prueba 450–500 si texto pequeño)
+- TEXT_ONLY                         (1 → desactiva CV y genera texto base)
+- NAME_HINTS                        ("GARCÍA|PÉREZ|S.L.|S.A.")
+- SECOND_LINE_FORCE                 (1 → concatena 2ª línea del nombre)
+- NEIGH_MIN_AREA_HARD               (área mínima para vecinos por color; p.ej. 300–1200)
+- NEIGH_MAX_DIST_RATIO              (filtrado por distancia 1.0–2.0)
+- ROW_BAND_FRAC                     (fallback por bandas si no hay sujeto)
+- DIAG_MODE                         (1 → adjunta debug)
 """
 from __future__ import annotations
 
 import base64
-import io
 import json
 import logging
 import math
 import os
 import re
-import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+import cv2
 import numpy as np
-from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
+import pytesseract
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pdf2image import convert_from_bytes
 from pydantic import BaseModel
 from PIL import Image
 
-# OCR y CV
-import pytesseract
-import cv2
-from pdf2image import convert_from_bytes
-
-# OpenAI (solo para la redacción notarial)
+# OpenAI opcional (solo para redacción notarial)
 try:
     from openai import OpenAI
-except Exception:  # paquete no instalado
+except Exception:
     OpenAI = None  # type: ignore
 
-__version__ = "0.7.2"
+__version__ = "0.7.3"
 
 # ----------------------------------------
-# Configuración y utilidades
+# Configuración
 # ----------------------------------------
 
 @dataclass
@@ -141,10 +121,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ----------------------------------------
+# Modelos
+# ----------------------------------------
 
-# ----------------------------------------
-# Modelos de I/O
-# ----------------------------------------
 class Linderos(BaseModel):
     norte: List[str] = []
     este: List[str] = []
@@ -158,30 +138,26 @@ class ExtractResult(BaseModel):
     notarial_text: Optional[str] = None
     note: Optional[str] = None
     debug: Optional[Dict] = None
-    files: Optional[Dict[str, str]] = None  # {"notarial_text.txt": base64}
+    files: Optional[Dict[str, str]] = None
 
 
 class MultiResult(BaseModel):
     results: List[ExtractResult]
     version: str
 
-
 # ----------------------------------------
-# Seguridad: token simple tipo Bearer (con esquema para Swagger)
+# Seguridad
 # ----------------------------------------
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 bearer_scheme = HTTPBearer(auto_error=False)
 
 def require_token(credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme)):
     if CFG.auth_token is None:
-        return  # sin auth en entorno → no aplicar (modo dev)
+        return
     if credentials is None or not credentials.credentials:
         raise HTTPException(status_code=401, detail="Falta o es inválido el encabezado Authorization (Bearer)")
-    token = credentials.credentials
-    if token != CFG.auth_token:
+    if credentials.credentials != CFG.auth_token:
         raise HTTPException(status_code=403, detail="Token no autorizado")
-
 
 # ----------------------------------------
 # OCR utilidades
@@ -202,35 +178,26 @@ def run_ocr(img_bgr: np.ndarray, psm: int = 6, lang: str = "spa+eng") -> Tuple[s
         return "", 0.0
 
 def _prepro_variants(gray: np.ndarray) -> List[np.ndarray]:
-    # Variantes de binarización y mejora
     outs: List[np.ndarray] = []
-    # 1) Adaptive + invert
-    thr1 = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                 cv2.THRESH_BINARY_INV, 31, 11)
+    thr1 = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 11)
     outs.append(255 - thr1)
-    # 2) Otsu (dos sentidos)
     _, thr2 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     outs.append(cv2.cvtColor(thr2, cv2.COLOR_GRAY2BGR))
     _, thr3 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     outs.append(cv2.cvtColor(255 - thr3, cv2.COLOR_GRAY2BGR))
-    # 3) CLAHE
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     cimg = clahe.apply(gray)
     _, thr4 = cv2.threshold(cimg, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     outs.append(cv2.cvtColor(thr4, cv2.COLOR_GRAY2BGR))
     return outs
 
-
 def run_ocr_multi(img_bgr: np.ndarray) -> Tuple[str, float]:
-    # Escalados para mejorar OCR
     variants: List[np.ndarray] = []
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     gray = cv2.bilateralFilter(gray, 5, 60, 60)
     for scale in (1.0, 1.5, 2.0):
         g = gray if scale == 1.0 else cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-        for bgrv in _prepro_variants(g):
-            variants.append(bgrv)
-
+        variants.extend(_prepro_variants(g))
     best_text, best_conf = "", 0.0
     for v in variants:
         for psm in (7, 6, 11):
@@ -240,7 +207,7 @@ def run_ocr_multi(img_bgr: np.ndarray) -> Tuple[str, float]:
     return best_text, best_conf
 
 # ----------------------------------------
-# Conversión PDF → imágenes
+# PDF → imágenes
 # ----------------------------------------
 
 def pdf_to_images(pdf_bytes: bytes, dpi: Optional[int] = None) -> List[np.ndarray]:
@@ -248,7 +215,7 @@ def pdf_to_images(pdf_bytes: bytes, dpi: Optional[int] = None) -> List[np.ndarra
     images = convert_from_bytes(pdf_bytes, dpi=use_dpi, fmt="png")
     out: List[np.ndarray] = []
     for im in images:
-        arr = np.array(im)  # RGBA/RGB/gris
+        arr = np.array(im)
         if arr.ndim == 2:
             arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
         elif arr.shape[2] == 4:
@@ -258,35 +225,37 @@ def pdf_to_images(pdf_bytes: bytes, dpi: Optional[int] = None) -> List[np.ndarra
         out.append(arr)
     return out
 
-
 # ----------------------------------------
-# Detección de parcelas por color (verde sujeto / rosa vecinos)
+# Segmentación por color (verde sujeto / rosa vecinos)
 # ----------------------------------------
 
 def detect_masks(bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    # Umbrales más amplios para documentos con rosa/verde pálido
-    lower_green = np.array([35, 20, 35])
-    upper_green = np.array([90, 255, 255])
-    # Rosa (magenta/rosado), cubriendo saturaciones bajas
-    lower_pink1 = np.array([150, 10, 40])
-    upper_pink1 = np.array([179, 255, 255])
-    lower_pink2 = np.array([0, 10, 40])
-    upper_pink2 = np.array([20, 255, 255])
 
+    # Verde (parcela objeto) — permisivo
+    lower_green = np.array([30, 10, 35])
+    upper_green = np.array([95, 255, 255])
     mask_green = cv2.inRange(hsv, lower_green, upper_green)
-    mask_pink = cv2.inRange(hsv, lower_pink1, upper_pink1) | cv2.inRange(hsv, lower_pink2, upper_pink2)
+
+    # Rosa/rojo/magenta (vecinos) — MUY permisivo (varios rangos)
+    ranges = [
+        (np.array([0,   5, 25]), np.array([25, 255, 255])),   # rojo-anaranjado pálido
+        (np.array([140, 5, 25]), np.array([179,255, 255])),   # rojo/magenta alto
+        (np.array([120,10, 40]), np.array([150,255, 255])),   # púrpura
+    ]
+    mask_pink = np.zeros(mask_green.shape, dtype=np.uint8)
+    for lo, hi in ranges:
+        mask_pink |= cv2.inRange(hsv, lo, hi)
 
     k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    # Limpieza y ligera dilatación para no perder piezas pequeñas
     mask_green = cv2.morphologyEx(mask_green, cv2.MORPH_OPEN, k5, iterations=1)
     mask_green = cv2.morphologyEx(mask_green, cv2.MORPH_CLOSE, k5, iterations=2)
     mask_green = cv2.dilate(mask_green, k3, iterations=1)
 
-    mask_pink = cv2.morphologyEx(mask_pink, cv2.MORPH_OPEN, k5, iterations=1)
-    mask_pink = cv2.morphologyEx(mask_pink, cv2.MORPH_CLOSE, k5, iterations=2)
-    mask_pink = cv2.dilate(mask_pink, k3, iterations=1)
+    mask_pink  = cv2.morphologyEx(mask_pink,  cv2.MORPH_OPEN, k5, iterations=1)
+    mask_pink  = cv2.morphologyEx(mask_pink,  cv2.MORPH_CLOSE, k5, iterations=2)
+    mask_pink  = cv2.dilate(mask_pink,  k3, iterations=1)
 
     return mask_green, mask_pink
 
@@ -304,20 +273,13 @@ def contours_and_centroids(mask: np.ndarray) -> List[Dict]:
         cx = int(M["m10"] / M["m00"])
         cy = int(M["m01"] / M["m00"])
         x, y, w, h = cv2.boundingRect(c)
-        out.append({
-            "contour": c,
-            "centroid": (cx, cy),
-            "bbox": (x, y, w, h),
-            "area": int(area),
-        })
-    # ordenar por área desc
-    out.sort(key=lambda d: -d["area"])
+        out.append({"contour": c, "centroid": (cx, cy), "bbox": (x, y, w, h), "area": int(area)})
+    out.sort(key=lambda d: -d["area"])  # área desc
     return out
 
 
 def choose_subject(subjects: List[Dict]) -> Optional[Dict]:
     return subjects[0] if subjects else None
-
 
 # ----------------------------------------
 # Asignación de orientaciones
@@ -326,16 +288,11 @@ def choose_subject(subjects: List[Dict]) -> Optional[Dict]:
 def angle_between(p0: Tuple[int, int], p1: Tuple[int, int]) -> float:
     dx = p1[0] - p0[0]
     dy = p1[1] - p0[1]
-    ang = math.degrees(math.atan2(-dy, dx))  # 0° hacia la derecha, 90° hacia arriba
-    ang = (ang + 360.0) % 360.0
-    return ang
+    ang = math.degrees(math.atan2(-dy, dx))  # 0°→E, 90°→N
+    return (ang + 360.0) % 360.0
 
 
 def angle_to_cardinals(ang: float) -> List[str]:
-    """Devuelve una o dos orientaciones cardinales en español.
-    Reglas: bandas de 45° → combina adyacentes (NE, SE, SO, NO)
-    337.5..22.5 → Este; 22.5..67.5 → NE; 67.5..112.5 → Norte; etc.
-    """
     bands = [
         (337.5, 360.0, ["este"]), (0.0, 22.5, ["este"]),
         (22.5, 67.5, ["norte", "este"]),
@@ -349,7 +306,7 @@ def angle_to_cardinals(ang: float) -> List[str]:
     for lo, hi, labels in bands:
         if lo < hi and (lo <= ang < hi):
             return labels
-        if lo > hi and (ang >= lo or ang < hi):  # banda 337.5..360 o 0..22.5
+        if lo > hi and (ang >= lo or ang < hi):
             return labels
     return ["este"]
 
@@ -358,15 +315,26 @@ def assign_orientations(subject_c: Tuple[int, int], neighbors: List[Dict]) -> Di
     idx_by_side: Dict[str, List[int]] = {"norte": [], "este": [], "sur": [], "oeste": []}
     for i, nb in enumerate(neighbors):
         ang = angle_between(subject_c, nb["centroid"])  # 0°→E, 90°→N
-        sides = angle_to_cardinals(ang)
-        for s in sides:
+        for s in angle_to_cardinals(ang):
             idx_by_side[s].append(i)
     return idx_by_side
 
+# ----------------------------------------
+# OCR de nombres
+# ----------------------------------------
 
-# ----------------------------------------
-# OCR de nombres en entorno del contorno
-# ----------------------------------------
+def postprocess_name(text: str) -> str:
+    s = re.sub(r"\s+", " ", (text or "")).strip()
+    if not s:
+        return ""
+    if CFG.reorder_to_nombre_apellidos and "," in s:
+        parts = [p.strip() for p in s.split(",")]
+        if len(parts) == 2 and len(parts[0]) >= 3 and len(parts[1]) >= 2:
+            s = f"{parts[1]} {parts[0]}"
+    s = s.replace("  ", " ")
+    s = re.sub(r"\b(TITULAR EN INVESTIGACION|TITULAR EN INVESTIGACIÓN)\b", "Titular en investigación", s, flags=re.I)
+    return s
+
 
 def clean_candidate_text(s: str) -> str:
     if not s:
@@ -378,20 +346,16 @@ def clean_candidate_text(s: str) -> str:
         if ch in up:
             return ""
     STOP = {"DATOS","ESCALA","LEYENDA","MAPA","COORDENADAS","COORD","REFERENCIA","CATASTRAL","PARCELA","POLIGONO","POLÍGONO","HOJA","AHORA","NORTE","SUR","ESTE","OESTE"}
-    for kw in STOP:
-        if kw in up:
-            return ""
-    companies = ["S.L","S.A","CB","S COOP","S.COOP","SCOOP"]
-    if any(c in up for c in companies):
+    if any(kw in up for kw in STOP):
+        return ""
+    if re.search(r"\b(S\.?:?L\.?(?:\b|$)|S\.?:?A\.?(?:\b|$)|CB\b|S\.?COOP\.?)", s, flags=re.I):
         return s
     for hint in NAME_HINTS:
         if hint and hint.lower() in s.lower():
             return s
     tokens = s.split()
     good = [t for t in tokens if (len(t) >= 2 and (t.isupper() or t.istitle()))]
-    if len(good) >= 2:
-        return " ".join(tokens[:6])
-    return ""
+    return " ".join(tokens[:6]) if len(good) >= 2 else ""
 
 
 def ocr_name_near(bgr: np.ndarray, bbox: Tuple[int, int, int, int]) -> Tuple[str, float]:
@@ -403,26 +367,9 @@ def ocr_name_near(bgr: np.ndarray, bbox: Tuple[int, int, int, int]) -> Tuple[str
     x1 = min(W, x + w + pad)
     y1 = min(H, y + h + pad)
     crop = bgr[y0:y1, x0:x1]
-
-    # OCR multi-intento (varios preprocesados y PSM), español+inglés
     text, conf = run_ocr_multi(crop)
     text = clean_candidate_text(postprocess_name(text))
     return text, conf
-
-
-def postprocess_name(text: str) -> str:
-    s = text
-    s = re.sub(r"\s+", " ", s).strip()
-    # Correcciones simples
-    s = s.replace("  ", " ")
-    # Normaliza comas en formato "APELLIDOS, NOMBRE"
-    if CFG.reorder_to_nombre_apellidos and "," in s:
-        parts = [p.strip() for p in s.split(",")]
-        if len(parts) == 2 and len(parts[0]) >= 3 and len(parts[1]) >= 2:
-            s = f"{parts[1]} {parts[0]}"
-    # Quita coletillas típicas
-    s = re.sub(r"\b(TITULAR EN INVESTIGACION|TITULAR EN INVESTIGACIÓN)\b", "Titular en investigación", s, flags=re.I)
-    return s
 
 
 def maybe_concat_second_line(lines: List[str]) -> str:
@@ -436,29 +383,63 @@ def maybe_concat_second_line(lines: List[str]) -> str:
         return top
     if len(below) <= CFG.second_line_maxchars and len(below.split()) <= CFG.second_line_maxtokens:
         if CFG.second_line_strict and not re.search(r"[A-ZÁÉÍÓÚÑ]{2,}", below):
-            return top  # no parece apellido claro
+            return top
         return f"{top} {below}"
     return top
 
+# ----------------------------------------
+# Fallback por texto (MSER)
+# ----------------------------------------
+
+def find_text_neighbors(bgr: np.ndarray, subject_bbox: Tuple[int,int,int,int]) -> List[Dict]:
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    try:
+        mser = cv2.MSER_create()
+    except Exception:
+        return []
+    regions, _ = mser.detectRegions(gray)
+
+    sx, sy, sw, sh = subject_bbox
+
+    def dist_to_rect(cx: int, cy: int, rect: Tuple[int, int, int, int]) -> float:
+        x, y, w, h = rect
+        dx = max(x - cx, 0, cx - (x + w))
+        dy = max(y - cy, 0, cy - (y + h))
+        return math.hypot(dx, dy)
+
+    maxd = CFG.neigh_max_dist_ratio * max(sw, sh) * 1.2
+    out: List[Dict] = []
+    for pts in regions:
+        x, y, w, h = cv2.boundingRect(pts)
+        if w < 20 or h < 10 or w > 700 or h > 220:
+            continue
+        area = w * h
+        cx, cy = x + w // 2, y + h // 2
+        d = dist_to_rect(cx, cy, subject_bbox)
+        if d == 0 or d > maxd:
+            continue
+        out.append({"centroid": (cx, cy), "bbox": (x, y, w, h), "area": area})
+    out.sort(key=lambda d: -d["area"])  # por tamaño
+    return out
 
 # ----------------------------------------
-# Redacción notarial con GPT-4o
+# Redacción notarial
 # ----------------------------------------
 
 def generate_notarial_text(extracted: Dict) -> str:
-    """Genera un texto notarial en español usando OpenAI GPT si hay API key; si no, plantilla local."""
     owners_by_side = extracted.get("linderos", {})
+
     def join_side(side: str) -> str:
         vals = owners_by_side.get(side, []) or []
-        vals = list(dict.fromkeys(vals))  # únicos preservando orden
+        vals = list(dict.fromkeys(vals))
         if not vals:
             return ""
         if len(vals) == 1:
             return f"{side.capitalize()}, {vals[0]}"
-        # Si hay varios en el mismo lado, únelos con 'y'
         return f"{side.capitalize()}, " + ", ".join(vals[:-1]) + f" y {vals[-1]}"
 
     sides_text = "; ".join([s for s in [join_side("norte"), join_side("sur"), join_side("este"), join_side("oeste")] if s])
+
     prompt = (
         "Redacta en estilo notarial, claro y conciso, un párrafo de linderos en español, "
         "a partir de la siguiente información de una certificación catastral. "
@@ -485,45 +466,29 @@ def generate_notarial_text(extracted: Dict) -> str:
         except Exception as e:
             logger.warning(f"OpenAI fallback por error: {e}")
 
-    # Fallback local
-    if sides_text:
-        return f"Linda: {sides_text}."
-    return "No se han podido determinar linderos suficientes para una redacción notarial fiable."
-
+    return f"Linda: {sides_text}." if sides_text else "No se han podido determinar linderos suficientes para una redacción notarial fiable."
 
 # ----------------------------------------
-# Proceso principal por PDF
+# Proceso principal
 # ----------------------------------------
 
 def process_pdf(pdf_bytes: bytes) -> ExtractResult:
-    # 1) Convertir a imágenes
     dpi = CFG.fast_dpi if CFG.fast_mode else CFG.pdf_dpi
     pages = pdf_to_images(pdf_bytes, dpi=dpi)
     if not pages:
         raise HTTPException(status_code=400, detail="No se pudo renderizar el PDF a imágenes")
 
-    # 2) Comprobación de legibilidad OCR mínima (política de rechazo 400)
-    sample = pages[0]
-    sample_text, conf = run_ocr(sample, psm=6, lang="spa+eng")
-    if len(sample_text) < 20:  # umbral bajo pero evita binarios/escaneos ilegibles
+    # Gate de legibilidad mínima
+    sample_text, conf = run_ocr(pages[0], psm=6, lang="spa+eng")
+    if len(sample_text) < 20:
         raise HTTPException(status_code=400, detail="El PDF no contiene texto OCR legible o metadatos reconocibles para su análisis.")
 
-    # Si se pide sólo texto (bypass CV)
     if CFG.text_only:
         ldr = Linderos(norte=[], sur=[], este=[], oeste=[])
-        owners = []
         notarial = generate_notarial_text({"linderos": ldr.dict()})
         files = {"notarial_text.txt": base64.b64encode(notarial.encode("utf-8")).decode("ascii")}
-        return ExtractResult(
-            linderos=ldr,
-            owners_detected=owners,
-            notarial_text=notarial,
-            note="TEXT_ONLY activo",
-            debug={"ocr_conf": conf},
-            files=files,
-        )
+        return ExtractResult(linderos=ldr, owners_detected=[], notarial_text=notarial, note="TEXT_ONLY activo", debug={"ocr_conf": conf}, files=files)
 
-    # 3) Extracción visual (primer página suficiente en CdG típica)
     bgr = pages[0]
     m_green, m_pink = detect_masks(bgr)
     subs = contours_and_centroids(m_green)
@@ -531,30 +496,17 @@ def process_pdf(pdf_bytes: bytes) -> ExtractResult:
 
     subj = choose_subject(subs)
     if not subj:
-        # Fallback por filas (arriba es Norte, abajo Sur). Sirve para casos sin color marcados
+        # Fallback por bandas (Norte/Sur)
         H, W = bgr.shape[:2]
         band = int(H * CFG.row_band_frac)
-        # OCR bandas
         top_txt, _ = run_ocr(bgr[0:band, :, :], psm=6)
         bot_txt, _ = run_ocr(bgr[H - band:H, :, :], psm=6)
-        ldr = Linderos(
-            norte=[top_txt[:60]] if top_txt else [],
-            sur=[bot_txt[:60]] if bot_txt else [],
-            este=[],
-            oeste=[],
-        )
+        ldr = Linderos(norte=[top_txt[:60]] if top_txt else [], sur=[bot_txt[:60]] if bot_txt else [], este=[], oeste=[])
         notarial = generate_notarial_text({"linderos": ldr.dict()})
         files = {"notarial_text.txt": base64.b64encode(notarial.encode("utf-8")).decode("ascii")}
-        return ExtractResult(
-            linderos=ldr,
-            owners_detected=[t for t in [top_txt, bot_txt] if t],
-            notarial_text=notarial,
-            note="Fallo detección de parcela principal; se aplicó fallback por bandas",
-            debug={"bands": {"row_band_frac": CFG.row_band_frac}},
-            files=files,
-        )
+        return ExtractResult(linderos=ldr, owners_detected=[t for t in [top_txt, bot_txt] if t], notarial_text=notarial, note="Fallback por bandas", debug={"bands": {"row_band_frac": CFG.row_band_frac}}, files=files)
 
-    # Filtra vecinos alejados del bbox de la parcela principal (evita cartelas/leyendas)
+    # Filtro por distancia (evitar cartelas)
     sx, sy, sw, sh = subj["bbox"]
 
     def _dist_to_rect(cx: int, cy: int, rect: Tuple[int, int, int, int]) -> float:
@@ -566,30 +518,31 @@ def process_pdf(pdf_bytes: bytes) -> ExtractResult:
     maxd = CFG.neigh_max_dist_ratio * max(sw, sh)
     neigh = [nb for nb in neigh if _dist_to_rect(nb["centroid"][0], nb["centroid"][1], subj["bbox"]) <= maxd]
 
+    # Fallback: si no hay vecinos por color, busca cajas de texto (MSER)
+    used_method = "color"
+    if not neigh:
+        neigh = find_text_neighbors(bgr, subj["bbox"])
+        used_method = "mser" if neigh else "none"
+
     subj_c = subj["centroid"]
     idx_by_side = assign_orientations(subj_c, neigh)
 
-    # 4) OCR de nombres alrededor de cada vecino
     owners_idx_to_name: Dict[int, str] = {}
     owners_idx_conf: Dict[int, float] = {}
     owners_detected: List[str] = []
 
     for i, nb in enumerate(neigh):
         name, conf = ocr_name_near(bgr, nb["bbox"])
-        # Heurística de segunda línea: intentar leer justo debajo de la caja
         x, y, w, h = nb["bbox"]
         line2_box = (x - int(0.2*w), y + h, int(w*1.4), int(h * 1.0))
         l2_name, l2_conf = ocr_name_near(bgr, line2_box)
         combined = maybe_concat_second_line([name, l2_name]) if name else l2_name
-        final = postprocess_name(combined or name or l2_name)
-        final = clean_candidate_text(final)
-
+        final = clean_candidate_text(postprocess_name(combined or name or l2_name))
         if final:
             owners_idx_to_name[i] = final
             owners_idx_conf[i] = max(conf, l2_conf)
             owners_detected.append(final)
 
-    # 5) Construcción de linderos (permite múltiples por lado)
     ldr = Linderos(norte=[], sur=[], este=[], oeste=[])
     for side, idxs in idx_by_side.items():
         for i in idxs:
@@ -597,9 +550,7 @@ def process_pdf(pdf_bytes: bytes) -> ExtractResult:
             if nm and nm not in getattr(ldr, side):
                 getattr(ldr, side).append(nm)
 
-    # 6) Redacción notarial
     notarial = generate_notarial_text({"linderos": ldr.dict()})
-
     files = {"notarial_text.txt": base64.b64encode(notarial.encode("utf-8")).decode("ascii")}
 
     debug = None
@@ -610,27 +561,20 @@ def process_pdf(pdf_bytes: bytes) -> ExtractResult:
                 {
                     "centroid": nb["centroid"],
                     "bbox": nb["bbox"],
-                    "area": nb["area"],
+                    "area": nb.get("area", 0),
                     "name": owners_idx_to_name.get(i),
                     "conf": owners_idx_conf.get(i, 0.0),
                 }
                 for i, nb in enumerate(neigh)
             ],
             "sides": idx_by_side,
+            "method": used_method,
         }
 
-    return ExtractResult(
-        linderos=ldr,
-        owners_detected=list(dict.fromkeys(owners_detected)),
-        notarial_text=notarial,
-        note=None,
-        debug=debug,
-        files=files,
-    )
-
+    return ExtractResult(linderos=ldr, owners_detected=list(dict.fromkeys(owners_detected)), notarial_text=notarial, note=None, debug=debug, files=files)
 
 # ----------------------------------------
-# Endpoint principal /extract
+# API
 # ----------------------------------------
 
 @app.post("/extract", response_model=MultiResult)
@@ -649,8 +593,7 @@ def extract_endpoint(
             raise HTTPException(status_code=400, detail=f"Archivo no PDF: {f.filename}")
         pdf_bytes = f.file.read()
         try:
-            res = process_pdf(pdf_bytes)
-            results.append(res)
+            results.append(process_pdf(pdf_bytes))
         except HTTPException:
             raise
         except Exception as e:
@@ -660,21 +603,14 @@ def extract_endpoint(
     return MultiResult(results=results, version=__version__)
 
 
-# ----------------------------------------
-# Salud
-# ----------------------------------------
-
 @app.get("/health")
 def health():
     return {"status": "ok", "version": __version__}
 
-
-# ----------------------------------------
-# Ejecución local (uvicorn)
-# ----------------------------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
+
 
 
 
