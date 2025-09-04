@@ -1,19 +1,16 @@
-from fastapi import FastAPI, UploadFile, File, Header, HTTPException
-from fastapi.responses import FileResponse
-from jose import JWTError, jwt
+
+from fastapi import FastAPI, HTTPException, UploadFile, File, Header
+from fastapi.responses import JSONResponse, FileResponse
 from typing import Optional
+from jose import JWTError, jwt
 import os
-from pathlib import Path
+import shutil
 
-# Configuración
-AUTH_TOKEN = os.environ.get("AUTH_TOKEN")
+app = FastAPI()
+
+AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "secret")
 ALGORITHM = "HS256"
-TEMP_DIR = "/tmp/autocata_texts"
-os.makedirs(TEMP_DIR, exist_ok=True)
 
-app = FastAPI(title="autoCata", version="0.7.0", description="Microservicio para certificaciones catastrales")
-
-# Función para verificar el token JWT
 def verify_token(token: str):
     try:
         payload = jwt.decode(token, AUTH_TOKEN, algorithms=[ALGORITHM])
@@ -21,55 +18,34 @@ def verify_token(token: str):
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-# Endpoint principal /extract
 @app.post("/extract")
-async def extract_from_pdf(
-    file: UploadFile = File(...),
-    authorization: Optional[str] = Header(None)
-):
+async def extract_from_pdf(file: UploadFile = File(...), authorization: Optional[str] = Header(None)):
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Authorization header missing or invalid")
-
     token = authorization.replace("Bearer ", "").strip()
     verify_token(token)
 
-    # Simulación de lógica real (mock por ahora)
-    linderos = {
-        "norte": "Ejemplo NORTE",
-        "sur": "Ejemplo SUR",
-        "este": "Ejemplo ESTE",
-        "oeste": "Ejemplo OESTE"
-    }
-    owners_detected = ["Ejemplo Titular 1", "Ejemplo Titular 2"]
+    filename = file.filename.replace(".pdf", ".txt")
+    file_path = f"/mnt/data/{filename}"
     notarial_text = "Linda al norte con Ejemplo NORTE, al sur con Ejemplo SUR, al este con Ejemplo ESTE y al oeste con Ejemplo OESTE."
-
-    # Guardar redacción notarial como archivo .txt
-    filename_base = Path(file.filename).stem.replace(" ", "_")
-    txt_path = f"{TEMP_DIR}/{filename_base}.txt"
-    with open(txt_path, "w") as f:
+    with open(file_path, "w") as f:
         f.write(notarial_text)
 
     return {
-        "linderos": linderos,
-        "owners_detected": owners_detected,
+        "linderos": {
+            "norte": "Ejemplo NORTE",
+            "sur": "Ejemplo SUR",
+            "este": "Ejemplo ESTE",
+            "oeste": "Ejemplo OESTE"
+        },
+        "owners_detected": ["Ejemplo Titular 1", "Ejemplo Titular 2"],
         "notarial_text": notarial_text,
-        "download_url": f"/download/{filename_base}.txt"
+        "download_url": f"/download/{filename}"
     }
 
-# Endpoint de descarga protegida por token
 @app.get("/download/{filename}")
-async def download_file(
-    filename: str,
-    authorization: Optional[str] = Header(None)
-):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Authorization header missing or invalid")
-
-    token = authorization.replace("Bearer ", "").strip()
-    verify_token(token)
-
-    file_path = os.path.join(TEMP_DIR, filename)
+async def download_file(filename: str):
+    file_path = f"/mnt/data/{filename}"
     if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="Archivo no encontrado")
-
-    return FileResponse(file_path, media_type="text/plain", filename=filename)
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(file_path, media_type='text/plain', filename=filename)
