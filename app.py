@@ -41,7 +41,7 @@ from pdf2image import convert_from_bytes
 from pydantic import BaseModel, Field
 from PIL import Image
 
-__version__ = "0.9.4"
+__version__ = "0.9.2"
 
 # ----------------------------------------
 # Configuración
@@ -79,8 +79,6 @@ class Cfg:
     diag_to_cardinals: bool = os.getenv("DIAG_TO_CARDINALS", "0") == "1"
 
     owner_allow_digits: bool = os.getenv("OWNER_ALLOW_DIGITS", "0") == "1"
-
-    match_min_score: float = float(os.getenv("MATCH_MIN_SCORE", "0.48"))  # NUEVA: mínimo para asociar nombre de fila con contorno rosa
 
 CFG = Cfg()
 
@@ -431,7 +429,7 @@ def decide_sides_smart(cov: Dict[str, float]) -> List[str]:
     return [best_side]
 
 # ----------------------------------------
-# OCR cerca del vecino + matching con nombre de fila
+# OCR cerca del vecino (fallback)
 # ----------------------------------------
 
 def ocr_name_near_with_linejoin(bgr: np.ndarray, bbox: Tuple[int,int,int,int], subj_c: Tuple[int,int]) -> str:
@@ -467,21 +465,6 @@ def ocr_name_near_with_linejoin(bgr: np.ndarray, bbox: Tuple[int,int,int,int], s
         if len(txt) > best_len:
             best, best_len = txt, len(txt)
     return best
-
-def _norm_for_match(s: str) -> List[str]:
-    s = strip_accents((s or "")).upper()
-    s = re.sub(r"[^A-ZÁÉÍÓÚÜÑ\s]", " ", s)
-    toks = [t for t in s.split() if t not in NAME_CONNECTORS and t not in GEO_TOKENS and t not in BAD_TOKENS]
-    return toks[:8]
-
-def token_overlap(a: List[str], b: List[str]) -> float:
-    if not a or not b:
-        return 0.0
-    sa, sb = set(a), set(b)
-    inter = len(sa & sb)
-    union = len(sa | sb) or 1
-    return inter / union
-
 
 # ----------------------------------------
 # Row-based mejorado (2 líneas)
@@ -627,12 +610,15 @@ def _extract_owner_from_row(bgr: np.ndarray, row_y: int, lines: int = 2) -> Tupl
 
 
 def detect_rows_and_extract8(bgr: np.ndarray) -> Tuple[Dict[str,List[str]], dict]:
-    """Asocia cada fila (titular) con el **contorno rosa** cuyo OCR cercano más se parece
-    al nombre de la fila (matching por tokens). Luego decide lados por cobertura angular.
+    """Extrae titulares por filas y decide lados usando cobertura angular (smart).
+    - Usa contornos reales (más robusto) para decidir E/S vs SE, etc.
+    - La extracción del nombre sigue siendo por la banda de titulares (2 líneas).
     """
     H, W = bgr.shape[:2]
+    top = int(H * 0.12); bottom = int(H * 0.92)
+    left = int(W * 0.06); right = int(W * 0.40)
 
-    # Detectamos sujeto y vecinos con contornos
+    # 1) Detectamos sujeto y vecinos con contorno en toda la imagen
     mask_green, mask_pink = detect_masks(bgr)
     subs = contours_and_centroids(mask_green)
     neigh = contours_and_centroids(mask_pink)
@@ -641,15 +627,69 @@ def detect_rows_and_extract8(bgr: np.ndarray) -> Tuple[Dict[str,List[str]], dict
     subj = subs[0]
     subj_c = subj["centroid"]
 
-    # OCR de referencia junto a cada contorno rosa (para matching)
-    neigh_ocr: List[Dict] = []
-    for nb in neigh[:24]:
-        name_near = ocr_name_near_with_linejoin(bgr, nb["bbox"], subj_c)
-        neigh_ocr.append({**nb, "name_near": name_near, "tokens": _norm_for_match(name_near)})
+    # 2) Para preservar el "escaneo por filas", calculamos los centros verdes en el recorte
+    def _centroids(mask: np.ndarray, min_area: int) -> List[Tuple[int,int,int]]:
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        out: List[Tuple[int,int,int]] = []
+        for c in cnts:
+            a = cv2.contourArea(c)
+            if a < min_area: continue
+            M = cv2.moments(c)
+            if M["m00"] == 0: continue
+            cx = int(M["m10"] / M["m00"]); cy = int(M["m01"] / M["m00"])
+            out.append((cx, cy, int(a)))
+        out.sort(key=lambda x: -x[2])
+        return out
 
-    # Escaneo por filas: centros verdes ordenados verticalmente en la banda de filas
-    top = int(H * 0.12); bottom = int(H * 0.92)
-    left = int(W * 0.06); r
+    mg_crop = mask_green[top:bottom, left:right]
+    mains  = _centroids(mg_crop, min_area=max(240, CFG.neigh_min_area_hard))
+    if not mains:
+        return {k: [] for k in ("norte","noreste","este","sureste","sur","suroeste","oeste","noroeste")}, {"rows": []}
+    mains_abs  = [(cx+left, cy+top, a) for (cx,cy,a) in mains]
+    mains_abs.sort(key=lambda t: t[1])
+
+    # 3) Para cada fila (main), elegimos el vecino rosa más cercano (con contorno) y
+    #    decidimos lados con cobertura angular smart.
+    ldr: Dict[str, List[str]] = {k: [] for k in ("norte","noreste","este","sureste","sur","suroeste","oeste","noroeste")}
+    rows_dbg: List[Dict] = []
+
+    def _eu2(p0: Tuple[int,int], p1: Tuple[int,int]) -> float:
+        return (p0[0]-p1[0])**2 + (p0[1]-p1[1])**2
+
+    for (mcx, mcy, _a) in mains_abs[:8]:
+        # 3a) Vecino rosa más cercano a esta fila
+        best_nb = None; best_d = 1e18
+        for nb in neigh:
+            d = _eu2((mcx, mcy), nb["centroid"])
+            if d < best_d:
+                best_d = d; best_nb = nb
+        if best_nb is None:
+            rows_dbg.append({"row_y": mcy, "main_center": [mcx, mcy], "neigh_center": None, "assigned": [], "owner": "", "roi_attempt": -1})
+            continue
+
+        # 3b) Cobertura angular respecto al sujeto
+        coverage = sector_coverage(subj_c, best_nb["contour"], step=8)
+        sides = decide_sides_smart(coverage)
+
+        # 3c) Nombre por banda de titulares (2 líneas + post-proceso)
+        owner, _roi, attempt_id = _extract_owner_from_row(bgr, row_y=mcy, lines=max(1, CFG.row_owner_lines))
+        owner = clean_candidate_text(postprocess_name(owner))
+        if owner:
+            for side in sides:
+                if owner not in ldr[side]:
+                    ldr[side].append(owner)
+        rows_dbg.append({
+            "row_y": mcy,
+            "main_center": [mcx, mcy],
+            "neigh_center": list(best_nb["centroid"]),
+            "coverage": coverage,
+            "assigned": sides,
+            "owner": owner,
+            "roi_attempt": attempt_id
+        })
+
+    return ldr, {"rows": rows_dbg, "used_rows": sum(len(v) for v in ldr.values())}
+
 # ----------------------------------------
 # Notarial agrupado
 # ----------------------------------------
@@ -826,6 +866,7 @@ def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
+
 
 
 
