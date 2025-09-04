@@ -52,7 +52,7 @@ import math
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -92,9 +92,7 @@ class Cfg:
 
     text_only: bool = os.getenv("TEXT_ONLY", "0") == "1"
 
-    name_hints: List[str] = (
-        [s.strip() for s in os.getenv("NAME_HINTS", "").split("|") if s.strip()]
-    )
+    name_hints: List[str] = field(default_factory=lambda: [s.strip() for s in os.getenv("NAME_HINTS", "").split("|") if s.strip()])
     name_hints_file: Optional[str] = os.getenv("NAME_HINTS_FILE")
 
     second_line_force: bool = os.getenv("SECOND_LINE_FORCE", "0") == "1"
@@ -167,15 +165,18 @@ class MultiResult(BaseModel):
 
 
 # ----------------------------------------
-# Seguridad: token simple tipo Bearer
+# Seguridad: token simple tipo Bearer (con esquema para Swagger)
 # ----------------------------------------
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-def require_token(authorization: Optional[str] = Header(None)):
+bearer_scheme = HTTPBearer(auto_error=False)
+
+def require_token(credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme)):
     if CFG.auth_token is None:
         return  # sin auth en entorno → no aplicar (modo dev)
-    if not authorization or not authorization.lower().startswith("bearer "):
+    if credentials is None or not credentials.credentials:
         raise HTTPException(status_code=401, detail="Falta o es inválido el encabezado Authorization (Bearer)")
-    token = authorization.split(" ", 1)[1].strip()
+    token = credentials.credentials
     if token != CFG.auth_token:
         raise HTTPException(status_code=403, detail="Token no autorizado")
 
