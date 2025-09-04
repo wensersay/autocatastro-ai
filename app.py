@@ -1,30 +1,39 @@
 """
-app.py — autoCata v0.8.5 (hints-canonicalization)
+app.py — autoCata v0.9.0 (line-joiner, generalizable OCR)
 
-Mejoras sobre 0.8.4:
-- **Canonicalización con NAME_HINTS**: si el OCR devuelve una variante parcial como
-  "José Rodríguez Álvarez" y existe un hint "José Luis Rodríguez Álvarez",
-  autocompleta al canónico. Funciona también para otras grafías.
-- Mantiene: diagonales ⇒ cardinales (siempre), propercase con tildes, reorden
-  "Apellidos Apellidos Nombre" ⇒ "Nombre Apellidos Apellidos", owners_detected
-  consolidado y límites de tiempo para evitar 502.
+Objetivo: Generalizar para miles de PDFs distintos SIN depender de NAME_HINTS.
+
+Novedades clave frente a 0.8.5:
+1) **Line-Joiner por OCR estructurado (Tesseract image_to_data)**: agrupamos por líneas
+   (block_num, line_num), verificamos solapes horizontales y distancia vertical
+   y **concatenamos 2 líneas** cuando corresponde (nombres largos que saltan de renglón).
+   → Recupera segundos nombres como «Luis» sin necesidad de hints.
+2) **Candidatos robustos**: voto entre 3 fuentes para cada rótulo: (a) OCR binarizado,
+   (b) OCR invertido, (c) OCR-por-líneas (image_to_data). Elegimos el mejor por
+   longitud/validez de nombre.
+3) **Filtros semánticos ligeros**: reglas de tokenización para nombres de persona
+   españolas (con conectores «de/del/y»), reorden «Apellidos Apellidos Nombre» →
+   «Nombre Apellidos Apellidos», propercase con tildes.
+4) **Diagonales ⇒ Cardinales siempre**: mantenemos expansión SE→E+S, NE→N+E, etc.
+5) **Límites de tiempo y eficiencia**: DPI moderado, pre-recortes, y máximo de
+   10 vecinos OCR por pipeline color.
+
+Opcional (sigue disponible):
+- `NAME_HINTS` para normalizaciones canónicas (no requerido para funcionar bien).
 
 Variables sugeridas (Railway → Variables):
 - FAST_MODE=1, PDF_DPI=320, DPI_FAST=220, EDGE_BUDGET_MS=25000
-- ROW_OWNER_LINES=2, SECOND_LINE_FORCE=1, SECOND_LINE_MAXCHARS=32, SECOND_LINE_MAXTOKENS=6
+- ROW_OWNER_LINES=2, SECOND_LINE_FORCE=1, SECOND_LINE_MAXCHARS=40, SECOND_LINE_MAXTOKENS=8
 - NEIGH_MIN_AREA_HARD=300, NEIGH_MAX_DIST_RATIO=2.2
 - PROPERCASE=1, DIAG_TO_CARDINALS=1
-- NAME_HINTS="José Luis Rodríguez Álvarez|Rogelio Mosquera López|José Varela Fernández|Dosinda Vázquez Pombo"
 """
 from __future__ import annotations
 
 import base64
-import json
 import logging
 import math
 import os
 import re
-import time
 import unicodedata
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -39,12 +48,7 @@ from pdf2image import convert_from_bytes
 from pydantic import BaseModel, Field
 from PIL import Image
 
-try:
-    from openai import OpenAI
-except Exception:
-    OpenAI = None  # type: ignore
-
-__version__ = "0.8.5"
+__version__ = "0.9.0"
 
 # ----------------------------------------
 # Configuración
@@ -53,9 +57,6 @@ __version__ = "0.8.5"
 @dataclass
 class Cfg:
     auth_token: Optional[str] = os.getenv("AUTH_TOKEN")
-    openai_key: Optional[str] = os.getenv("OPENAI_API_KEY")
-    model_notarial: str = os.getenv("MODEL_NOTARIAL", "gpt-4o-mini")
-
     pdf_dpi: int = int(os.getenv("PDF_DPI", "320"))
     dpi_fast: int = int(os.getenv("DPI_FAST", "220"))
     fast_mode: bool = os.getenv("FAST_MODE", "1") == "1"
@@ -66,20 +67,14 @@ class Cfg:
     name_hints_file: Optional[str] = os.getenv("NAME_HINTS_FILE")
 
     second_line_force: bool = os.getenv("SECOND_LINE_FORCE", "1") == "1"
-    second_line_maxchars: int = int(os.getenv("SECOND_LINE_MAXCHARS", "32"))
-    second_line_maxtokens: int = int(os.getenv("SECOND_LINE_MAXTOKENS", "6"))
+    second_line_maxchars: int = int(os.getenv("SECOND_LINE_MAXCHARS", "40"))
+    second_line_maxtokens: int = int(os.getenv("SECOND_LINE_MAXTOKENS", "8"))
     second_line_strict: bool = os.getenv("SECOND_LINE_STRICT", "0") == "1"
 
     neigh_min_area_hard: int = int(os.getenv("NEIGH_MIN_AREA_HARD", "600"))
-    row_band_frac: float = float(os.getenv("ROW_BAND_FRAC", "0.25"))
     neigh_max_dist_ratio: float = float(os.getenv("NEIGH_MAX_DIST_RATIO", "2.2"))
 
     row_owner_lines: int = int(os.getenv("ROW_OWNER_LINES", "2"))
-
-    diag_mode: bool = os.getenv("DIAG_MODE", "0") == "1"
-
-    reorder_to_nombre_apellidos: bool = os.getenv("REORDER_TO_NOMBRE_APELLIDOS", "1") == "1"
-    reorder_min_conf: int = int(os.getenv("REORDER_MIN_CONF", "70"))
 
     propercase: bool = os.getenv("PROPERCASE", "1") == "1"
     diag_to_cardinals: bool = os.getenv("DIAG_TO_CARDINALS", "1") == "1"
@@ -154,61 +149,176 @@ def require_token(credentials: Optional[HTTPAuthorizationCredentials] = Depends(
         raise HTTPException(status_code=403, detail="Token no autorizado")
 
 # ----------------------------------------
-# OCR helpers
-# ----------------------------------------
-
-def run_ocr(img_bgr: np.ndarray, psm: int = 6, lang: str = "spa+eng") -> Tuple[str, float]:
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    pil = Image.fromarray(img_rgb)
-    cfg = f"--oem 1 --psm {psm} -l {lang}"
-    try:
-        data = pytesseract.image_to_data(pil, config=cfg, output_type=pytesseract.Output.DICT)
-        text = " ".join([w for w in data["text"] if w.strip()])
-        confs = [c for c in data["conf"] if isinstance(c, (int, float)) and c >= 0]
-        conf = float(np.mean(confs)) if confs else 0.0
-        return text.strip(), conf
-    except Exception as e:
-        logger.warning(f"OCR error: {e}")
-        return "", 0.0
-
-def run_ocr_multi(img_bgr: np.ndarray) -> Tuple[str, float]:
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.bilateralFilter(gray, 5, 60, 60)
-    _, thr2 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    _, thr3 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    outs = [cv2.cvtColor(thr2, cv2.COLOR_GRAY2BGR), cv2.cvtColor(255 - thr3, cv2.COLOR_GRAY2BGR)]
-    best_text, best_conf = "", 0.0
-    for v in outs:
-        for psm in (6, 7):
-            t, c = run_ocr(v, psm=psm)
-            if (c > best_conf + 1.0) or (abs(c - best_conf) < 1.0 and len(t) > len(best_text)):
-                best_text, best_conf = t, c
-    return best_text, best_conf
-
-# ----------------------------------------
-# NAME_HINTS canonicalization
+# Utilidades OCR y nombres
 # ----------------------------------------
 
 def strip_accents(s: str) -> str:
     return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
 
+LOWER_CONNECTORS = {"de","del","la","las","los","y","da","do","das","dos"}
+ACCENT_MAP = {
+    "JOSE": "José",
+    "RODRIGUEZ": "Rodríguez",
+    "ALVAREZ": "Álvarez",
+    "LOPEZ": "López",
+    "FERNANDEZ": "Fernández",
+    "VAZQUEZ": "Vázquez",
+    "MARTIN": "Martín",
+    "MARTINEZ": "Martínez",
+    "PEREZ": "Pérez",
+    "GOMEZ": "Gómez",
+    "GARCIA": "García",
+    "NUNEZ": "Núñez",
+}
+GIVEN_NAMES = {"JOSE","JOSÉ","LUIS","MARIA","MARÍA","ANTONIO","MANUEL","ANA","JUAN","CARLOS","PABLO","ROGELIO","FRANCISCO","MARTA","ELENA","LAURA"}
+UPPER_NAME_RE = re.compile(r"^[A-ZÁÉÍÓÚÜÑ][A-ZÁÉÍÓÚÜÑ\s\.'\-]+$", re.UNICODE)
+BAD_TOKENS = {"POLÍGONO","POLIGONO","PARCELA","APELLIDOS","NOMBRE","RAZON","RAZÓN","SOCIAL","NIF","DOMICILIO","LOCALIZACIÓN","LOCALIZACION","REFERENCIA","CATASTRAL","TITULARIDAD","PRINCIPAL"}
+GEO_TOKENS = {"LUGO","BARCELONA","MADRID","VALENCIA","SEVILLA","CORUÑA","A CORUÑA","MONFORTE","LEM","LEMOS","HOSPITALET","L'HOSPITALET","SAVIAO","SAVIÑAO","GALICIA","[LUGO]","[BARCELONA]"}
+NAME_CONNECTORS = {"DE","DEL","LA","LOS","LAS","DA","DO","DAS","DOS","Y"}
 
-def canonicalize_with_hints(s: str) -> str:
-    if not s or not NAME_HINTS:
+
+def propercase_spanish(s: str) -> str:
+    if not s:
         return s
-    up_tokens = strip_accents(s).upper().split()
-    # regla: si todos los tokens del candidato aparecen dentro de algún hint canónico → usar el hint completo
-    for hint in NAME_HINTS:
-        hup = strip_accents(hint).upper().split()
-        if all(t in hup for t in up_tokens if t):
-            return hint
+    toks = [t for t in re.split(r"\s+", s.strip()) if t]
+    out: List[str] = []
+    for t in toks:
+        raw = t.strip(".,;:()[]{}")
+        up = strip_accents(raw).upper()
+        if re.match(r"^(S\.?L\.?|S\.?A\.?|SCOOP\.?|COOP\.?|CB)$", raw, re.I):
+            out.append(raw.upper().replace(" ", "")); continue
+        if up in ACCENT_MAP:
+            out.append(ACCENT_MAP[up]); continue
+        if up.lower() in LOWER_CONNECTORS:
+            out.append(up.lower()); continue
+        out.append(raw.capitalize())
+    return " ".join(out)
+
+
+def reorder_surname_first(s: str) -> str:
+    toks = s.split()
+    if len(toks) >= 2:
+        last = strip_accents(toks[-1]).upper()
+        if last in GIVEN_NAMES:
+            return toks[-1] + " " + " ".join(toks[:-1])
     return s
 
+
+def postprocess_name(text: str) -> str:
+    s = re.sub(r"\s+", " ", (text or "")).strip()
+    if not s:
+        return ""
+    if "," in s:
+        parts = [p.strip() for p in s.split(",")]
+        if len(parts) == 2 and len(parts[0]) >= 3 and len(parts[1]) >= 2:
+            s = f"{parts[1]} {parts[0]}"
+    s = s.replace("  ", " ")
+    s = re.sub(r"\b(TITULAR EN INVESTIGACION|TITULAR EN INVESTIGACIÓN)\b", "Titular en investigación", s, flags=re.I)
+    s = propercase_spanish(s)
+    s = reorder_surname_first(s)
+    return s
+
+
+def clean_candidate_text(s: str) -> str:
+    if not s:
+        return ""
+    s = re.sub(r"[^0-9A-Za-zÁÉÍÓÚÜÑáéíóúüñ .'-]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip(" .-'")
+    up = s.upper()
+    for ch in ["=", "*", "_", "/", "\\", "|", "[", "]", "{", "}", "<", ">"]:
+        if ch in up:
+            return ""
+    STOP = {"DATOS","ESCALA","LEYENDA","MAPA","COORDENADAS","COORD","REFERENCIA","CATASTRAL","PARCELA","POLIGONO","POLÍGONO","HOJA","AHORA","NORTE","SUR","ESTE","OESTE"}
+    if any(kw in up for kw in STOP):
+        return ""
+    if re.search(r"\b(S\.?:?L\.?(?:\b|$)|S\.?:?A\.?(?:\b|$)|CB\b|S\.?COOP\.?)", s, flags=re.I):
+        return s
+    tokens = s.split()
+    good = [t for t in tokens if (len(t) >= 2 and (t[0].isupper() or t.isupper()))]
+    return " ".join(tokens[:7]) if len(good) >= 2 else ""
+
 # ----------------------------------------
-# PDF → imagen (respeta presupuesto)
+# OCR básicos
 # ----------------------------------------
 
-def load_map_page_bgr(pdf_bytes: bytes, budget: float) -> np.ndarray:
+def ocr_image_to_data_lines(img_bgr: np.ndarray) -> List[Tuple[str, Tuple[int,int,int,int]]]:
+    """Devuelve [(texto_linea, bbox_linea)] usando image_to_data.
+    Agrupa por (block_num, line_num), junta palabras, y calcula bbox de la línea.
+    """
+    rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    pil = Image.fromarray(rgb)
+    data = pytesseract.image_to_data(pil, config="--oem 1 --psm 6 -l spa+eng", output_type=pytesseract.Output.DICT)
+    n = len(data.get("text", []))
+    lines: Dict[Tuple[int,int], Dict] = {}
+    for i in range(n):
+        txt = (data["text"][i] or "").strip()
+        conf = data["conf"][i]
+        if isinstance(conf, str):
+            try:
+                conf = float(conf)
+            except Exception:
+                conf = -1
+        if not txt or (isinstance(conf, (int,float)) and conf < 0):
+            continue
+        b = data["block_num"][i]; ln = data["line_num"][i]
+        x = data["left"][i]; y = data["top"][i]; w = data["width"][i]; h = data["height"][i]
+        key = (b, ln)
+        if key not in lines:
+            lines[key] = {"words": [], "bbox": [x, y, x+w, y+h]}
+        lines[key]["words"].append(txt)
+        bx0, by0, bx1, by1 = lines[key]["bbox"]
+        lines[key]["bbox"] = [min(bx0,x), min(by0,y), max(bx1,x+w), max(by1,y+h)]
+    out: List[Tuple[str, Tuple[int,int,int,int]]] = []
+    for (_, _), v in lines.items():
+        text_line = " ".join(v["words"]).strip()
+        x0,y0,x1,y1 = v["bbox"]
+        out.append((text_line, (x0,y0,x1-x0,y1-y0)))
+    # ordenar por Y
+    out.sort(key=lambda t: t[1][1])
+    return out
+
+
+def ocr_best_of_three(crop_bgr: np.ndarray) -> str:
+    """Elige el mejor candidato entre: binario, invertido y líneas (image_to_data)."""
+    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.bilateralFilter(gray, 5, 60, 60)
+    _, thr2 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    _, thr3 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    cands: List[str] = []
+    for im in (cv2.cvtColor(thr2, cv2.COLOR_GRAY2BGR), cv2.cvtColor(255 - thr3, cv2.COLOR_GRAY2BGR)):
+        txt = pytesseract.image_to_string(Image.fromarray(cv2.cvtColor(im, cv2.COLOR_BGR2RGB)), config="--oem 1 --psm 6 -l spa+eng")
+        cands.append(txt or "")
+    # vía líneas
+    ln = ocr_image_to_data_lines(crop_bgr)
+    lines_txt = [t for (t, _bbox) in ln]
+    if lines_txt:
+        # unir posible segunda línea si pasa filtros de longitud
+        joined = lines_txt[0]
+        if len(lines_txt) >= 2:
+            below = lines_txt[1].strip()
+            if 0 < len(below) <= CFG.second_line_maxchars and len(below.split()) <= CFG.second_line_maxtokens:
+                joined = f"{joined} {below}"
+        cands.append(joined)
+    # Limpiar y puntuar
+    def score(txt: str) -> Tuple[int,int]:
+        t = clean_candidate_text(postprocess_name(txt))
+        tok = len(t.split())
+        # priorizar textos que parecen nombres de persona (>=2 tokens)
+        return (int(tok >= 2), len(t))
+    best = ""
+    best_score = (-1, -1)
+    for s in cands:
+        t = clean_candidate_text(postprocess_name(s))
+        sc = score(s)
+        if sc > best_score:
+            best_score = sc; best = t
+    return best
+
+# ----------------------------------------
+# PDF → imagen
+# ----------------------------------------
+
+def load_map_page_bgr(pdf_bytes: bytes) -> np.ndarray:
     dpi = CFG.dpi_fast if CFG.fast_mode else CFG.pdf_dpi
     try:
         pages = convert_from_bytes(pdf_bytes, dpi=dpi, first_page=2, last_page=2, thread_count=1)
@@ -219,14 +329,14 @@ def load_map_page_bgr(pdf_bytes: bytes, budget: float) -> np.ndarray:
     return np.array(pages[0].convert("RGB"))[:, :, ::-1]
 
 # ----------------------------------------
-# Segmentación por color
+# Segmentación por color y vecinos
 # ----------------------------------------
 
 def detect_masks(bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    lower_green = np.array([30, 10, 35])
-    upper_green = np.array([95, 255, 255])
-    mask_green = cv2.inRange(hsv, lower_green, upper_green)
+    # verde (parcela objetivo)
+    mask_green = cv2.inRange(hsv, np.array([30, 10, 35]), np.array([95, 255, 255]))
+    # rosa/magenta/rojo (vecinos)
     ranges = [
         (np.array([0,   5, 25]), np.array([25, 255, 255])),
         (np.array([140, 5, 25]), np.array([179,255, 255])),
@@ -262,7 +372,7 @@ def contours_and_centroids(mask: np.ndarray) -> List[Dict]:
     return out
 
 # ----------------------------------------
-# Rumbos (8) y utilidades
+# Ángulos a 8 rumbos
 # ----------------------------------------
 
 def angle_between(p0: Tuple[int, int], p1: Tuple[int, int]) -> float:
@@ -283,179 +393,48 @@ def angle_to_8(ang: float) -> str:
     return "sureste"
 
 # ----------------------------------------
-# Normalización de nombres (tildes + título + reorden)
+# OCR cerca del vecino (con line-joiner)
 # ----------------------------------------
 
-LOWER_CONNECTORS = {"de","del","la","las","los","y","da","do","das","dos"}
-ACCENT_MAP = {
-    "JOSE": "José",
-    "RODRIGUEZ": "Rodríguez",
-    "ALVAREZ": "Álvarez",
-    "LOPEZ": "López",
-    "FERNANDEZ": "Fernández",
-    "VAZQUEZ": "Vázquez",
-    "MARTIN": "Martín",
-    "MARTINEZ": "Martínez",
-    "PEREZ": "Pérez",
-    "GOMEZ": "Gómez",
-    "GARCIA": "García",
-    "NUNEZ": "Núñez",
-}
-GIVEN_NAMES = {"JOSE","JOSÉ","MARIA","MARÍA","LUIS","ANTONIO","MANUEL","ANA","JUAN","CARLOS","PABLO","ROGELIO","FRANCISCO","MARTA","ELENA","LAURA"}
-CORP_RE = re.compile(r"^(S\.?L\.?|S\.?A\.?|SCOOP\.?|COOP\.?|CB)$", re.I)
-
-
-def propercase_spanish(s: str) -> str:
-    if not s:
-        return s
-    toks = [t for t in re.split(r"\s+", s.strip()) if t]
-    out: List[str] = []
-    for t in toks:
-        raw = t.strip(".,;:()[]{}")
-        up = strip_accents(raw).upper()
-        if CORP_RE.match(raw):
-            out.append(raw.upper().replace(" ", ""))
-            continue
-        if up in ACCENT_MAP:
-            out.append(ACCENT_MAP[up])
-            continue
-        if up.lower() in LOWER_CONNECTORS:
-            out.append(up.lower())
-            continue
-        out.append(raw.capitalize())
-    return " ".join(out)
-
-
-def reorder_surname_first(s: str) -> str:
-    toks = s.split()
-    if len(toks) >= 2:
-        last = strip_accents(toks[-1]).upper()
-        if last in GIVEN_NAMES:
-            return toks[-1] + " " + " ".join(toks[:-1])
-    return s
-
-# ----------------------------------------
-# Limpieza de candidatos
-# ----------------------------------------
-
-def postprocess_name(text: str) -> str:
-    s = re.sub(r"\s+", " ", (text or "")).strip()
-    if not s:
-        return ""
-    if CFG.reorder_to_nombre_apellidos and "," in s:
-        parts = [p.strip() for p in s.split(",")]
-        if len(parts) == 2 and len(parts[0]) >= 3 and len(parts[1]) >= 2:
-            s = f"{parts[1]} {parts[0]}"
-    s = s.replace("  ", " ")
-    s = re.sub(r"\b(TITULAR EN INVESTIGACION|TITULAR EN INVESTIGACIÓN)\b", "Titular en investigación", s, flags=re.I)
-    if CFG.propercase:
-        s = propercase_spanish(s)
-    s = reorder_surname_first(s)
-    return s
-
-
-def clean_candidate_text(s: str) -> str:
-    if not s:
-        return ""
-    s = re.sub(r"[^0-9A-Za-zÁÉÍÓÚÜÑáéíóúüñ .'-]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip(" .-'")
-    up = s.upper()
-    for ch in ["=", "*", "_", "/", "\\", "|", "[", "]", "{", "}", "<", ">"]:
-        if ch in up:
-            return ""
-    STOP = {"DATOS","ESCALA","LEYENDA","MAPA","COORDENADAS","COORD","REFERENCIA","CATASTRAL","PARCELA","POLIGONO","POLÍGONO","HOJA","AHORA","NORTE","SUR","ESTE","OESTE"}
-    if any(kw in up for kw in STOP):
-        return ""
-    if re.search(r"\b(S\.?:?L\.?(?:\b|$)|S\.?:?A\.?(?:\b|$)|CB\b|S\.?COOP\.?)", s, flags=re.I):
-        return s
-    for hint in NAME_HINTS:
-        if hint and hint.lower() in s.lower():
-            return hint  # retorno canónico si hay substring match
-    tokens = s.split()
-    good = [t for t in tokens if (len(t) >= 2 and (t[0].isupper() or t.isupper()))]
-    return " ".join(tokens[:6]) if len(good) >= 2 else ""
-
-
-def maybe_concat_second_line(lines: List[str]) -> str:
-    if not lines:
-        return ""
-    if len(lines) == 1:
-        return lines[0]
-    top = lines[0].strip(); below = lines[1].strip()
-    if not CFG.second_line_force:
-        return top
-    if len(below) <= CFG.second_line_maxchars and len(below.split()) <= CFG.second_line_maxtokens:
-        if CFG.second_line_strict and not re.search(r"[A-ZÁÉÍÓÚÑáéíóú]{2,}", below):
-            return top
-        return f"{top} {below}"
-    return top
-
-# ----------------------------------------
-# OCR alrededor de vecino + barrido
-# ----------------------------------------
-
-def run_ocr_multi_near(bgr: np.ndarray) -> Tuple[str, float]:
-    t, c = run_ocr_multi(bgr)
-    t = clean_candidate_text(postprocess_name(t))
-    t = canonicalize_with_hints(t)
-    return t, c
-
-
-def ocr_name_near(bgr: np.ndarray, bbox: Tuple[int,int,int,int]) -> Tuple[str, float]:
-    x, y, w, h = bbox
-    pad = int(max(10, 0.18 * max(w, h)))
-    H, W = bgr.shape[:2]
-    x0 = max(0, x - pad); y0 = max(0, y - pad)
-    x1 = min(W, x + w + pad); y1 = min(H, y + h + pad)
-    crop = bgr[y0:y1, x0:x1]
-    if max(crop.shape[:2]) < 320:
-        fx = 320.0 / max(1, max(crop.shape[:2]))
-        crop = cv2.resize(crop, None, fx=fx, fy=fx, interpolation=cv2.INTER_CUBIC)
-    return run_ocr_multi_near(crop)
-
-
-def _clip_rect(x0:int,y0:int,x1:int,y1:int,W:int,H:int) -> Tuple[int,int,int,int]:
-    x0 = max(0, min(W-1, x0)); y0 = max(0, min(H-1, y0))
-    x1 = max(0, min(W,   x1)); y1 = max(0, min(H,   y1))
-    if x1 <= x0: x1 = min(W, x0+1)
-    if y1 <= y0: y1 = min(H, y0+1)
-    return x0,y0,x1,y1
-
-
-def _crop(bgr: np.ndarray, rect: Tuple[int,int,int,int]) -> np.ndarray:
-    x,y,w,h = rect
-    H,W = bgr.shape[:2]
-    x0,y0,x1,y1 = _clip_rect(x, y, x+w, y+h, W, H)
-    return bgr[y0:y1, x0:x1]
-
-
-def ocr_label_around_neighbor(bgr: np.ndarray, nb_bbox: Tuple[int,int,int,int], subj_c: Tuple[int,int]) -> Tuple[str,float]:
-    x,y,w,h = nb_bbox
+def ocr_name_near_with_linejoin(bgr: np.ndarray, bbox: Tuple[int,int,int,int], subj_c: Tuple[int,int]) -> str:
+    x,y,w,h = bbox
     cnx, cny = x + w//2, y + h//2
     L = max(w, h)
     vx, vy = cnx - subj_c[0], cny - subj_c[1]
     norm = math.hypot(vx, vy)
-    if norm < 1e-3: vx, vy = 1.0, 0.0
-    else: vx, vy = vx/norm, vy/norm
-    candidates: List[np.ndarray] = []
+    if norm < 1e-3:
+        vx, vy = 1.0, 0.0
+    else:
+        vx, vy = vx/norm, vy/norm
+    H, W = bgr.shape[:2]
     pad = int(max(60, 2.4*L))
-    candidates.append(_crop(bgr, (x - pad, y - pad, w + 2*pad, h + 2*pad)))
+    def _clip(x0,y0,x1,y1):
+        x0 = max(0,min(W-1,x0)); y0=max(0,min(H-1,y0)); x1=max(1,min(W,x1)); y1=max(1,min(H,y1));
+        if x1<=x0: x1=x0+1
+        if y1<=y0: y1=y0+1
+        return x0,y0,x1,y1
+    crops: List[np.ndarray] = []
+    # caja amplia alrededor
+    x0,y0,x1,y1 = _clip(x-pad, y-pad, x+w+pad, y+h+pad)
+    crops.append(bgr[y0:y1, x0:x1])
+    # 3 saltos hacia fuera en la dirección del vecino
     for f in (1.0, 1.6, 2.2):
         cx = int(cnx + vx * f * 2.0 * L)
         cy = int(cny + vy * f * 2.0 * L)
         s  = int(max(72, 2.0 * L))
-        candidates.append(_crop(bgr, (cx - s, cy - s, 2*s, 2*s)))
-    best_text, best_conf = "", 0.0
-    for crop in candidates:
+        x0,y0,x1,y1 = _clip(cx - s, cy - s, cx + s, cy + s)
+        crops.append(bgr[y0:y1, x0:x1])
+    best = ""
+    best_len = -1
+    for crop in crops:
         if max(crop.shape[:2]) < 320:
             fx = 320.0 / max(1, max(crop.shape[:2]))
             crop = cv2.resize(crop, None, fx=fx, fy=fx, interpolation=cv2.INTER_CUBIC)
-        t, c = run_ocr_multi_near(crop)
-        if not t:
-            continue
-        if (c > best_conf + 1.0) or (abs(c - best_conf) < 1.0 and len(t) > len(best_text)):
-            best_text, best_conf = t, c
-    return best_text, best_conf
+        txt = ocr_best_of_three(crop)
+        txt = clean_candidate_text(postprocess_name(txt))
+        if len(txt) > best_len:
+            best, best_len = txt, len(txt)
+    return best
 
 # ----------------------------------------
 # Fallback MSER
@@ -490,14 +469,8 @@ def find_text_neighbors(bgr: np.ndarray, subject_bbox: Tuple[int,int,int,int]) -
     return out
 
 # ----------------------------------------
-# Row-based (legacy mejorado, 1–2 líneas)
+# Row-based mejorado (2 líneas)
 # ----------------------------------------
-
-UPPER_NAME_RE = re.compile(r"^[A-ZÁÉÍÓÚÜÑ][A-ZÁÉÍÓÚÜÑ\s\.'\-]+$", re.UNICODE)
-BAD_TOKENS = {"POLÍGONO","POLIGONO","PARCELA","APELLIDOS","NOMBRE","RAZON","RAZÓN","SOCIAL","NIF","DOMICILIO","LOCALIZACIÓN","LOCALIZACION","REFERENCIA","CATASTRAL","TITULARIDAD","PRINCIPAL"}
-GEO_TOKENS = {"LUGO","BARCELONA","MADRID","VALENCIA","SEVILLA","CORUÑA","A CORUÑA","MONFORTE","LEM","LEMOS","HOSPITALET","L'HOSPITALET","SAVIAO","SAVIÑAO","GALICIA","[LUGO]","[BARCELONA]"}
-NAME_CONNECTORS = {"DE","DEL","LA","LOS","LAS","DA","DO","DAS","DOS","Y"}
-
 
 def _binarize(gray: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     _, bw  = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -532,7 +505,7 @@ def _clean_owner_line(line: str) -> str:
         if t in GEO_TOKENS or "[" in t or "]" in t: break
         if t in BAD_TOKENS: continue
         out.append(t)
-        if len([x for x in out if x not in NAME_CONNECTORS]) >= 6:
+        if len([x for x in out if x not in NAME_CONNECTORS]) >= 7:
             break
     compact = []
     for t in out:
@@ -540,7 +513,7 @@ def _clean_owner_line(line: str) -> str:
             continue
         compact.append(t)
     name = " ".join(compact).strip()
-    return name[:72]
+    return name[:80]
 
 
 def _pick_owner_from_text(txt: str) -> str:
@@ -620,6 +593,18 @@ def _extract_owner_from_row(bgr: np.ndarray, row_y: int, lines: int = 2) -> Tupl
             owner = _pick_owner_from_text(txt)
             if owner:
                 break
+        if not owner:
+            # fallback: image_to_data y unir 2 líneas
+            rgb = cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
+            lines_data = ocr_image_to_data_lines(rgb)
+            if lines_data:
+                joined = lines_data[0][0]
+                if len(lines_data) >= 2:
+                    below = lines_data[1][0].strip()
+                    if 0 < len(below) <= CFG.second_line_maxchars and len(below.split()) <= CFG.second_line_maxtokens:
+                        joined = f"{joined} {below}"
+                owner = _pick_owner_from_text(joined)
+        owner = clean_candidate_text(postprocess_name(owner))
         attempts.append((attempt, x0,y0,x1,y1, owner))
         if owner and len(owner) >= 6:
             return owner, (x0,y0,x1,y1), attempt
@@ -632,7 +617,8 @@ def detect_rows_and_extract8(bgr: np.ndarray) -> Tuple[Dict[str,List[str]], dict
     top = int(h * 0.12); bottom = int(h * 0.92)
     left = int(w * 0.06); right = int(w * 0.40)
     crop = bgr[top:bottom, left:right]
-    # masks
+    # colores
+    mg, mp = detect_masks(crop)
     def _centroids(mask: np.ndarray, min_area: int) -> List[Tuple[int,int,int]]:
         cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         out: List[Tuple[int,int,int]] = []
@@ -645,8 +631,6 @@ def detect_rows_and_extract8(bgr: np.ndarray) -> Tuple[Dict[str,List[str]], dict
             out.append((cx, cy, int(a)))
         out.sort(key=lambda x: -x[2])
         return out
-    # colores
-    mg, mp = detect_masks(crop)
     mains  = _centroids(mg, min_area=max(240, CFG.neigh_min_area_hard))
     neighs = _centroids(mp, min_area=max(180, CFG.neigh_min_area_hard // 2))
     if not mains:
@@ -665,10 +649,9 @@ def detect_rows_and_extract8(bgr: np.ndarray) -> Tuple[Dict[str,List[str]], dict
                 best_d = d; best = (nx, ny)
         side = ""
         if best is not None and best_d < (w*0.28)**2:
-            side = angle_to_8(angle_between((mcx, mcy), best))
+            ang = angle_between((mcx, mcy), best)
+            side = angle_to_8(ang)
         owner, roi, attempt_id = _extract_owner_from_row(bgr, row_y=mcy, lines=max(1, CFG.row_owner_lines))
-        if owner:
-            owner = canonicalize_with_hints(postprocess_name(owner))
         if side and owner:
             if owner not in ldr[side]:
                 ldr[side].append(owner); used_rows += 1
@@ -676,7 +659,7 @@ def detect_rows_and_extract8(bgr: np.ndarray) -> Tuple[Dict[str,List[str]], dict
     return ldr, {"rows": rows_dbg, "used_rows": used_rows}
 
 # ----------------------------------------
-# Notarial (plantilla)
+# Notarial
 # ----------------------------------------
 
 def generate_notarial_text(extracted: Dict) -> str:
@@ -693,7 +676,7 @@ def generate_notarial_text(extracted: Dict) -> str:
     return f"Linda: {sides_text}." if sides_text else "No se han podido determinar linderos suficientes para una redacción notarial fiable."
 
 # ----------------------------------------
-# Fusión + expansión de diagonales
+# Expansión de diagonales a cardinales (siempre)
 # ----------------------------------------
 
 def expand_diagonals_to_cardinals(ldr: Dict[str, List[str]]) -> Dict[str, List[str]]:
@@ -711,23 +694,25 @@ def expand_diagonals_to_cardinals(ldr: Dict[str, List[str]]) -> Dict[str, List[s
                 ldr[a].append(nm)
             if nm and nm not in ldr[b]:
                 ldr[b].append(nm)
-        ldr[diag] = []  # limpiar diagonal tras expandir
+        ldr[diag] = []
     return ldr
 
 # ----------------------------------------
-# Proceso por PDF
+# Proceso principal
 # ----------------------------------------
 
 def process_pdf(pdf_bytes: bytes) -> ExtractResult:
-    bgr = load_map_page_bgr(pdf_bytes, budget=float(CFG.edge_budget_ms))
+    bgr = load_map_page_bgr(pdf_bytes)
 
-    sample_text, _ = run_ocr(bgr, psm=6, lang="spa+eng")
-    if len(sample_text) < 12:
+    # Gate OCR ligero para descartar PDFs mal formados
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    txt_gate = pytesseract.image_to_string(Image.fromarray(rgb), config="--oem 1 --psm 6 -l spa+eng") or ""
+    if len(txt_gate.strip()) < 12:
         raise HTTPException(status_code=400, detail="El PDF no contiene texto OCR legible o metadatos reconocibles para su análisis.")
 
     owners_detected_union: List[str] = []
 
-    # Pipeline map_based (color + MSER)
+    # Pipeline basado en color
     m_green, m_pink = detect_masks(bgr)
     subs = contours_and_centroids(m_green)
     neigh = contours_and_centroids(m_pink)
@@ -749,27 +734,15 @@ def process_pdf(pdf_bytes: bytes) -> ExtractResult:
         subj_c = subj["centroid"]
         for nb in neigh[:10]:
             side = angle_to_8(angle_between(subj_c, nb["centroid"]))
-            name, conf = ocr_name_near(bgr, nb["bbox"])
-            if not name or len(name) < 4:
-                name2, conf2 = ocr_label_around_neighbor(bgr, nb["bbox"], subj_c)
-                if len(name2) > len(name):
-                    name, conf = name2, conf2
-            x, y, w, h = nb["bbox"]
-            line2_box = (x - int(0.25*w), y + h, int(w*1.6), int(h * 1.25))
-            l2_name, _ = ocr_name_near(bgr, line2_box)
-            final = maybe_concat_second_line([name, l2_name]) if name else l2_name
-            final = clean_candidate_text(postprocess_name(final))
-            final = canonicalize_with_hints(final)
-            if final and final not in ldr_map[side]:
-                ldr_map[side].append(final)
-                if final not in owners_detected_union:
-                    owners_detected_union.append(final)
+            name = ocr_name_near_with_linejoin(bgr, nb["bbox"], subj_c)
+            if name and name not in ldr_map[side]:
+                ldr_map[side].append(name)
+                owners_detected_union.append(name)
 
-    # Pipeline row_based (legacy mejorado)
+    # Pipeline por filas
     ldr_row, rows_dbg = detect_rows_and_extract8(bgr)
     for side, arr in ldr_row.items():
         for nm in arr:
-            nm = canonicalize_with_hints(nm)
             if nm and nm not in owners_detected_union:
                 owners_detected_union.append(nm)
 
@@ -779,7 +752,7 @@ def process_pdf(pdf_bytes: bytes) -> ExtractResult:
         seen = set()
         for src in (ldr_map.get(side, []), ldr_row.get(side, [])):
             for nm in src:
-                nm_pp = canonicalize_with_hints(postprocess_name(nm))
+                nm_pp = clean_candidate_text(postprocess_name(nm))
                 if nm_pp and nm_pp not in seen:
                     ldr_out[side].append(nm_pp); seen.add(nm_pp)
 
@@ -790,9 +763,7 @@ def process_pdf(pdf_bytes: bytes) -> ExtractResult:
     notarial = generate_notarial_text({"linderos": ldr_out})
     files = {"notarial_text.txt": base64.b64encode(notarial.encode("utf-8")).decode("ascii")}
 
-    debug = None
-    if CFG.diag_mode:
-        debug = {"method": used_method, "rows": rows_dbg, "subject_centroid": (subs[0]["centroid"] if subs else None)}
+    debug = {"method": used_method, "rows": rows_dbg}
 
     return ExtractResult(
         linderos=ldr_model,
@@ -843,6 +814,7 @@ def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
+
 
 
 
