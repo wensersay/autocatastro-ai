@@ -287,7 +287,7 @@ def ocr_best_of_three(crop_bgr: np.ndarray) -> str:
     _, thr2 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     _, thr3 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     cands: List[str] = []
-    for im in (cv2.cvtColor(thr2, cv2.COLOR_BGR2BGR), cv2.cvtColor(255 - thr3, cv2.COLOR_GRAY2BGR)):
+    for im in (cv2.cvtColor(thr2, cv2.COLOR_GRAY2BGR), cv2.cvtColor(255 - thr3, cv2.COLOR_GRAY2BGR)):
         txt = pytesseract.image_to_string(Image.fromarray(cv2.cvtColor(im, cv2.COLOR_BGR2RGB)), config="--oem 1 --psm 6 -l spa+eng")
         cands.append(txt or "")
     ln = ocr_image_to_data_lines(crop_bgr)
@@ -842,10 +842,6 @@ def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
-
-
-
-
 
 
 
