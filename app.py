@@ -78,6 +78,8 @@ __version__ = "0.7.1"
 # Configuración y utilidades
 # ----------------------------------------
 
+from dataclasses import dataclass, field
+
 @dataclass
 class Cfg:
     auth_token: Optional[str] = os.getenv("AUTH_TOKEN")
@@ -85,14 +87,18 @@ class Cfg:
     model_notarial: str = os.getenv("MODEL_NOTARIAL", "gpt-4o-mini")
 
     pdf_dpi: int = int(os.getenv("PDF_DPI", "300"))
-    auto_dpi: Optional[int] = int(os.getenv("AUTO_DPI")) if os.getenv("AUTO_DPI") else None
+    auto_dpi: Optional[int] = (int(os.getenv("AUTO_DPI")) if os.getenv("AUTO_DPI") else None)
     fast_dpi: int = int(os.getenv("FAST_DPI", "220"))
     slow_dpi: int = int(os.getenv("SLOW_DPI", "400"))
     fast_mode: bool = os.getenv("FAST_MODE", "0") == "1"
 
     text_only: bool = os.getenv("TEXT_ONLY", "0") == "1"
 
-       name_hints: List[str] = field(default_factory=lambda: [s.strip() for s in os.getenv("NAME_HINTS", "").split("|") if s.strip()])
+    name_hints: List[str] = field(
+        default_factory=lambda: [
+            s.strip() for s in os.getenv("NAME_HINTS", "").split("|") if s.strip()
+        ]
+    )
     name_hints_file: Optional[str] = os.getenv("NAME_HINTS_FILE")
 
     second_line_force: bool = os.getenv("SECOND_LINE_FORCE", "0") == "1"
