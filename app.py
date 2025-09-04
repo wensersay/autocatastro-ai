@@ -610,24 +610,11 @@ def _extract_owner_from_row(bgr: np.ndarray, row_y: int, lines: int = 2) -> Tupl
 
 
 def detect_rows_and_extract8(bgr: np.ndarray) -> Tuple[Dict[str,List[str]], dict]:
-    """Extrae titulares por filas y decide lados usando cobertura angular (smart).
-    - Usa contornos reales (más robusto) para decidir E/S vs SE, etc.
-    - La extracción del nombre sigue siendo por la banda de titulares (2 líneas).
-    """
-    H, W = bgr.shape[:2]
-    top = int(H * 0.12); bottom = int(H * 0.92)
-    left = int(W * 0.06); right = int(W * 0.40)
-
-    # 1) Detectamos sujeto y vecinos con contorno en toda la imagen
-    mask_green, mask_pink = detect_masks(bgr)
-    subs = contours_and_centroids(mask_green)
-    neigh = contours_and_centroids(mask_pink)
-    if not subs:
-        return {k: [] for k in ("norte","noreste","este","sureste","sur","suroeste","oeste","noroeste")}, {"rows": []}
-    subj = subs[0]
-    subj_c = subj["centroid"]
-
-    # 2) Para preservar el "escaneo por filas", calculamos los centros verdes en el recorte
+    h, w = bgr.shape[:2]
+    top = int(h * 0.12); bottom = int(h * 0.92)
+    left = int(w * 0.06); right = int(w * 0.40)
+    crop = bgr[top:bottom, left:right]
+    # colores
     def _centroids(mask: np.ndarray, min_area: int) -> List[Tuple[int,int,int]]:
         cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         out: List[Tuple[int,int,int]] = []
@@ -640,55 +627,44 @@ def detect_rows_and_extract8(bgr: np.ndarray) -> Tuple[Dict[str,List[str]], dict
             out.append((cx, cy, int(a)))
         out.sort(key=lambda x: -x[2])
         return out
-
-    mg_crop = mask_green[top:bottom, left:right]
-    mains  = _centroids(mg_crop, min_area=max(240, CFG.neigh_min_area_hard))
+    mg, mp = detect_masks(crop)
+    mains  = _centroids(mg, min_area=max(240, CFG.neigh_min_area_hard))
+    neighs = _centroids(mp, min_area=max(180, CFG.neigh_min_area_hard // 2))
     if not mains:
         return {k: [] for k in ("norte","noreste","este","sureste","sur","suroeste","oeste","noroeste")}, {"rows": []}
     mains_abs  = [(cx+left, cy+top, a) for (cx,cy,a) in mains]
     mains_abs.sort(key=lambda t: t[1])
-
-    # 3) Para cada fila (main), elegimos el vecino rosa más cercano (con contorno) y
-    #    decidimos lados con cobertura angular smart.
+    neighs_abs = [(cx+left, cy+top, a) for (cx,cy,a) in neighs]
     ldr: Dict[str, List[str]] = {k: [] for k in ("norte","noreste","este","sureste","sur","suroeste","oeste","noroeste")}
-    rows_dbg: List[Dict] = []
-
-    def _eu2(p0: Tuple[int,int], p1: Tuple[int,int]) -> float:
-        return (p0[0]-p1[0])**2 + (p0[1]-p1[1])**2
-
+    rows_dbg = []
+    used_rows = 0
+    def side_of(main_xy: Tuple[int,int], pt_xy: Tuple[int,int]) -> str:
+        cx, cy = main_xy; x, y = pt_xy
+        sx, sy = x - cx, y - cy
+        ang = math.degrees(math.atan2(-(sy), sx))
+        if -22.5 <= ang <= 22.5: return "este"
+        if 22.5 < ang <= 67.5:  return "noreste"
+        if 67.5 < ang <= 112.5: return "norte"
+        if 112.5 < ang <= 157.5:return "noroeste"
+        if -67.5 <= ang < -22.5:return "sureste"
+        if -112.5 <= ang < -67.5:return "sur"
+        if -157.5 <= ang < -112.5:return "suroeste"
+        return "oeste"
     for (mcx, mcy, _a) in mains_abs[:8]:
-        # 3a) Vecino rosa más cercano a esta fila
-        best_nb = None; best_d = 1e18
-        for nb in neigh:
-            d = _eu2((mcx, mcy), nb["centroid"])
+        best = None; best_d = 1e18
+        for (nx, ny, _na) in neighs_abs:
+            d = (nx-mcx)**2 + (ny-mcy)**2
             if d < best_d:
-                best_d = d; best_nb = nb
-        if best_nb is None:
-            rows_dbg.append({"row_y": mcy, "main_center": [mcx, mcy], "neigh_center": None, "assigned": [], "owner": "", "roi_attempt": -1})
-            continue
-
-        # 3b) Cobertura angular respecto al sujeto
-        coverage = sector_coverage(subj_c, best_nb["contour"], step=8)
-        sides = decide_sides_smart(coverage)
-
-        # 3c) Nombre por banda de titulares (2 líneas + post-proceso)
+                best_d = d; best = (nx, ny)
+        side = ""
+        if best is not None and best_d < (w*0.28)**2:
+            side = side_of((mcx, mcy), best)
         owner, _roi, attempt_id = _extract_owner_from_row(bgr, row_y=mcy, lines=max(1, CFG.row_owner_lines))
-        owner = clean_candidate_text(postprocess_name(owner))
-        if owner:
-            for side in sides:
-                if owner not in ldr[side]:
-                    ldr[side].append(owner)
-        rows_dbg.append({
-            "row_y": mcy,
-            "main_center": [mcx, mcy],
-            "neigh_center": list(best_nb["centroid"]),
-            "coverage": coverage,
-            "assigned": sides,
-            "owner": owner,
-            "roi_attempt": attempt_id
-        })
-
-    return ldr, {"rows": rows_dbg, "used_rows": sum(len(v) for v in ldr.values())}
+        if side and owner:
+            if owner not in ldr[side]:
+                ldr[side].append(owner); used_rows += 1
+        rows_dbg.append({"row_y": mcy, "main_center": [mcx, mcy], "neigh_center": list(best) if best else None, "side": side, "owner": owner, "roi_attempt": attempt_id})
+    return ldr, {"rows": rows_dbg, "used_rows": used_rows}
 
 # ----------------------------------------
 # Notarial agrupado
@@ -866,6 +842,7 @@ def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
+
 
 
 
