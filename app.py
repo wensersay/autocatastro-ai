@@ -80,6 +80,11 @@ class Cfg:
 
     owner_allow_digits: bool = os.getenv("OWNER_ALLOW_DIGITS", "0") == "1"
 
+    anti_header_kws: List[str] = field(default_factory=lambda: [
+        s.strip() for s in os.getenv("ANTI_HEADER_KWS", "TITULARIDAD|PRINCIPAL|TITULAR|SECUNDARIA|S/S|SS").split("|")
+        if s.strip()
+    ])
+
 CFG = Cfg()
 
 NAME_HINTS: set[str] = set()
@@ -154,6 +159,8 @@ def require_token(credentials: Optional[HTTPAuthorizationCredentials] = Depends(
 def strip_accents(s: str) -> str:
     return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
 
+ANTI_HEADER = set(strip_accents(s).upper() for s in CFG.anti_header_kws)
+
 LOWER_CONNECTORS = {"de","del","la","las","los","y","da","do","das","dos"}
 ACCENT_MAP = {
     "JOSE": "José", "RODRIGUEZ": "Rodríguez", "ALVAREZ": "Álvarez", "LOPEZ": "López",
@@ -223,24 +230,59 @@ def looks_like_address(s: str) -> bool:
     return False
 
 
+def drop_anti_header_tokens(s: str) -> str:
+    if not s:
+        return ""
+    toks = s.strip().split()
+    kept = []
+    for t in toks:
+        raw = t.strip(".,;:()[]{}")
+        norm = strip_accents(raw).upper()
+        if norm in ANTI_HEADER:
+            continue
+        kept.append(t)
+    out = " ".join([t for t in kept if t]).strip()
+    return " ".join(out.split())
+
+
 def clean_candidate_text(s: str) -> str:
     if not s:
         return ""
-    s = re.sub(r"[^0-9A-Za-zÁÉÍÓÚÜÑáéíóúüñ .'-]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip(" .-'")
+    # 1) Quitar tokens de cabecera de tabla
+    s = drop_anti_header_tokens(s)
+
+    # 2) Sanitizar sin regex
+    out_chars = []
+    for ch in s:
+        cat = unicodedata.category(ch)
+        if cat.startswith('L') or cat.startswith('N') or ch in " .'-":
+            out_chars.append(ch)
+        else:
+            out_chars.append(' ')
+    s = "".join(out_chars)
+    s = " ".join(s.split()).strip(" .-'")
     up = strip_accents(s).upper()
-    for ch in ["=", "*", "_", "/", "\\", "|", "[", "]", "{", "}", "<", ">"]:
+
+    # 3) Defensa frente a símbolos / rótulos
+    for ch in ["=","*","_","/","\","|","[","]","{","}","<",">"]:
         if ch in up:
             return ""
-    STOP = {"DATOS","ESCALA","LEYENDA","MAPA","COORDENADAS","COORD","REFERENCIA","CATASTRAL","PARCELA","POLIGONO","POLÍGONO","HOJA","AHORA","NORTE","SUR","ESTE","OESTE"}
+    STOP = {
+        "DATOS","ESCALA","LEYENDA","MAPA","COORDENADAS","COORD","REFERENCIA","CATASTRAL",
+        "PARCELA","POLIGONO","POLÍGONO","HOJA","AHORA","NORTE","SUR","ESTE","OESTE",
+        "TITULARIDAD","PRINCIPAL","TITULAR","SECUNDARIA"
+    }
     if any(kw in up for kw in STOP):
         return ""
+
+    # 4) Direcciones / números
     if looks_like_address(up):
         return ""
-    if not CFG.owner_allow_digits and re.search(r"\d", up):
-        # permitir sociedades sin números explícitos
-        if not re.search(r"\b(S\.?L\.?|S\.?A\.?|SCOOP\.?|COOP\.?|CB)\b", up):
+    if not CFG.owner_allow_digits and any(c.isdigit() for c in up):
+        if not any(tok in up for tok in ("S.L","S L","S.A","S A","SCOOP","COOP"," CB","CB ")):
             return ""
+
+    # 5) Requiere al menos 2 tokens "de nombre"
     tokens = s.split()
     good = [t for t in tokens if (len(t) >= 2 and (t[0].isupper() or t.isupper()))]
     return " ".join(tokens[:7]) if len(good) >= 2 else ""
@@ -842,6 +884,7 @@ def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
+
 
 
 
