@@ -224,17 +224,13 @@ def _prepro_variants(gray: np.ndarray) -> List[np.ndarray]:
     outs.append(cv2.cvtColor(thr4, cv2.COLOR_GRAY2BGR))
     return outs
 
-
 def run_ocr_multi(img_bgr: np.ndarray) -> Tuple[str, float]:
     # Escalados para mejorar OCR
     variants: List[np.ndarray] = []
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     gray = cv2.bilateralFilter(gray, 5, 60, 60)
     for scale in (1.0, 1.5, 2.0):
-        if scale != 1.0:
-            g = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-        else:
-            g = gray
+        g = gray if scale == 1.0 else cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
         for bgrv in _prepro_variants(g):
             variants.append(bgrv)
 
@@ -250,12 +246,12 @@ def run_ocr_multi(img_bgr: np.ndarray) -> Tuple[str, float]:
 # Conversión PDF → imágenes
 # ----------------------------------------
 
-def pdf_to_images(pdf_bytes: bytes, dpi: Optional[int] = None) -> List[np.ndarray]:(pdf_bytes: bytes, dpi: Optional[int] = None) -> List[np.ndarray]:
+def pdf_to_images(pdf_bytes: bytes, dpi: Optional[int] = None) -> List[np.ndarray]:
     use_dpi = dpi or CFG.pdf_dpi
     images = convert_from_bytes(pdf_bytes, dpi=use_dpi, fmt="png")
-    out = []
+    out: List[np.ndarray] = []
     for im in images:
-        arr = np.array(im)  # RGBA/RGB
+        arr = np.array(im)  # RGBA/RGB/gris
         if arr.ndim == 2:
             arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
         elif arr.shape[2] == 4:
