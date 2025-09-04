@@ -533,7 +533,7 @@ def generate_notarial_text_grouped(owners_by_side: Dict[str, List[str]]) -> str:
             parts.append(f"{side.capitalize()}, {arr[0]}")
         else:
             parts.append(f"{side.capitalize()}, " + ", ".join(arr[:-1]) + f" y {arr[-1]}")
-    return f"Linda: {"; ".join(parts)}." if parts else "No se han podido determinar linderos suficientes para una redacción notarial fiable."
+    return ("Linda: " + "; ".join(parts) + ".") if parts else "No se han podido determinar linderos suficientes para una redacción notarial fiable."
 
 # ----------------------------------------
 # Proceso principal
@@ -659,6 +659,7 @@ def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
+
 
 
 
