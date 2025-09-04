@@ -72,7 +72,7 @@ try:
 except Exception:  # paquete no instalado
     OpenAI = None  # type: ignore
 
-__version__ = "0.7.0"
+__version__ = "0.7.1"
 
 # ----------------------------------------
 # Configuración y utilidades
@@ -92,7 +92,7 @@ class Cfg:
 
     text_only: bool = os.getenv("TEXT_ONLY", "0") == "1"
 
-    name_hints: List[str] = field(default_factory=lambda: [s.strip() for s in os.getenv("NAME_HINTS", "").split("|") if s.strip()])
+       name_hints: List[str] = field(default_factory=lambda: [s.strip() for s in os.getenv("NAME_HINTS", "").split("|") if s.strip()])
     name_hints_file: Optional[str] = os.getenv("NAME_HINTS_FILE")
 
     second_line_force: bool = os.getenv("SECOND_LINE_FORCE", "0") == "1"
@@ -100,7 +100,7 @@ class Cfg:
     second_line_maxtokens: int = int(os.getenv("SECOND_LINE_MAXTOKENS", "5"))
     second_line_strict: bool = os.getenv("SECOND_LINE_STRICT", "0") == "1"
 
-    neigh_min_area_hard: int = int(os.getenv("NEIGH_MIN_AREA_HARD", "1800"))
+    neigh_min_area_hard: int = int(os.getenv("NEIGH_MIN_AREA_HARD", "1200"))
     side_max_dist_frac: float = float(os.getenv("SIDE_MAX_DIST_FRAC", "0.65"))
     row_band_frac: float = float(os.getenv("ROW_BAND_FRAC", "0.25"))
 
@@ -185,7 +185,7 @@ def require_token(credentials: Optional[HTTPAuthorizationCredentials] = Depends(
 # OCR utilidades
 # ----------------------------------------
 
-def run_ocr(img_bgr: np.ndarray, psm: int = 6, lang: str = "spa") -> Tuple[str, float]:
+def run_ocr(img_bgr: np.ndarray, psm: int = 6, lang: str = "spa+eng") -> Tuple[str, float]:
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     pil = Image.fromarray(img_rgb)
     cfg = f"--oem 1 --psm {psm} -l {lang}"
@@ -199,12 +199,52 @@ def run_ocr(img_bgr: np.ndarray, psm: int = 6, lang: str = "spa") -> Tuple[str, 
         logger.warning(f"OCR error: {e}")
         return "", 0.0
 
+def _prepro_variants(gray: np.ndarray) -> List[np.ndarray]:
+    # Variantes de binarización y mejora
+    outs: List[np.ndarray] = []
+    # 1) Adaptive + invert
+    thr1 = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                 cv2.THRESH_BINARY_INV, 31, 11)
+    outs.append(255 - thr1)
+    # 2) Otsu (dos sentidos)
+    _, thr2 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    outs.append(cv2.cvtColor(thr2, cv2.COLOR_GRAY2BGR))
+    _, thr3 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    outs.append(cv2.cvtColor(255 - thr3, cv2.COLOR_GRAY2BGR))
+    # 3) CLAHE
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    cimg = clahe.apply(gray)
+    _, thr4 = cv2.threshold(cimg, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    outs.append(cv2.cvtColor(thr4, cv2.COLOR_GRAY2BGR))
+    return outs
+
+
+def run_ocr_multi(img_bgr: np.ndarray) -> Tuple[str, float]:
+    # Escalados para mejorar OCR
+    variants: List[np.ndarray] = []
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.bilateralFilter(gray, 5, 60, 60)
+    for scale in (1.0, 1.5, 2.0):
+        if scale != 1.0:
+            g = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        else:
+            g = gray
+        for bgrv in _prepro_variants(g):
+            variants.append(bgrv)
+
+    best_text, best_conf = "", 0.0
+    for v in variants:
+        for psm in (7, 6, 11):
+            t, c = run_ocr(v, psm=psm)
+            if (c > best_conf + 1.0) or (abs(c - best_conf) < 1.0 and len(t) > len(best_text)):
+                best_text, best_conf = t, c
+    return best_text, best_conf
 
 # ----------------------------------------
 # Conversión PDF → imágenes
 # ----------------------------------------
 
-def pdf_to_images(pdf_bytes: bytes, dpi: Optional[int] = None) -> List[np.ndarray]:
+def pdf_to_images(pdf_bytes: bytes, dpi: Optional[int] = None) -> List[np.ndarray]:(pdf_bytes: bytes, dpi: Optional[int] = None) -> List[np.ndarray]:
     use_dpi = dpi or CFG.pdf_dpi
     images = convert_from_bytes(pdf_bytes, dpi=use_dpi, fmt="png")
     out = []
@@ -226,26 +266,28 @@ def pdf_to_images(pdf_bytes: bytes, dpi: Optional[int] = None) -> List[np.ndarra
 
 def detect_masks(bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    # Umbrales heurísticos; pueden ajustarse según documentos
-    # Verde (parcela objeto de estudio)
-    lower_green = np.array([35, 25, 40])
-    upper_green = np.array([85, 255, 255])
-    # Rosa (vecinos) – tonos magenta/rosados
-    lower_pink1 = np.array([140, 30, 60])
+    # Umbrales más amplios para documentos con rosa/verde pálido
+    lower_green = np.array([35, 20, 35])
+    upper_green = np.array([90, 255, 255])
+    # Rosa (magenta/rosado), cubriendo saturaciones bajas
+    lower_pink1 = np.array([150, 10, 40])
     upper_pink1 = np.array([179, 255, 255])
-    lower_pink2 = np.array([0, 30, 60])
-    upper_pink2 = np.array([10, 255, 255])
+    lower_pink2 = np.array([0, 10, 40])
+    upper_pink2 = np.array([20, 255, 255])
 
     mask_green = cv2.inRange(hsv, lower_green, upper_green)
     mask_pink = cv2.inRange(hsv, lower_pink1, upper_pink1) | cv2.inRange(hsv, lower_pink2, upper_pink2)
 
-    # Limpieza
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    mask_green = cv2.morphologyEx(mask_green, cv2.MORPH_OPEN, k, iterations=2)
-    mask_green = cv2.morphologyEx(mask_green, cv2.MORPH_CLOSE, k, iterations=2)
+    k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    # Limpieza y ligera dilatación para no perder piezas pequeñas
+    mask_green = cv2.morphologyEx(mask_green, cv2.MORPH_OPEN, k5, iterations=1)
+    mask_green = cv2.morphologyEx(mask_green, cv2.MORPH_CLOSE, k5, iterations=2)
+    mask_green = cv2.dilate(mask_green, k3, iterations=1)
 
-    mask_pink = cv2.morphologyEx(mask_pink, cv2.MORPH_OPEN, k, iterations=2)
-    mask_pink = cv2.morphologyEx(mask_pink, cv2.MORPH_CLOSE, k, iterations=2)
+    mask_pink = cv2.morphologyEx(mask_pink, cv2.MORPH_OPEN, k5, iterations=1)
+    mask_pink = cv2.morphologyEx(mask_pink, cv2.MORPH_CLOSE, k5, iterations=2)
+    mask_pink = cv2.dilate(mask_pink, k3, iterations=1)
 
     return mask_green, mask_pink
 
@@ -329,7 +371,7 @@ def assign_orientations(subject_c: Tuple[int, int], neighbors: List[Dict]) -> Di
 
 def ocr_name_near(bgr: np.ndarray, bbox: Tuple[int, int, int, int]) -> Tuple[str, float]:
     x, y, w, h = bbox
-    pad = int(max(8, 0.07 * max(w, h)))
+    pad = int(max(10, 0.10 * max(w, h)))
     H, W = bgr.shape[:2]
     x0 = max(0, x - pad)
     y0 = max(0, y - pad)
@@ -337,18 +379,8 @@ def ocr_name_near(bgr: np.ndarray, bbox: Tuple[int, int, int, int]) -> Tuple[str
     y1 = min(H, y + h + pad)
     crop = bgr[y0:y1, x0:x1]
 
-    # prepro para realzar texto negro
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    gray = cv2.bilateralFilter(gray, 5, 60, 60)
-    thr = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                cv2.THRESH_BINARY_INV, 31, 11)
-    k = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-    thr = cv2.morphologyEx(thr, cv2.MORPH_OPEN, k, iterations=1)
-    thr = cv2.morphologyEx(thr, cv2.MORPH_CLOSE, k, iterations=1)
-    inv = 255 - thr
-    inv_bgr = cv2.cvtColor(inv, cv2.COLOR_GRAY2BGR)
-
-    text, conf = run_ocr(inv_bgr, psm=6, lang="spa")
+    # OCR multi-intento (varios preprocesados y PSM), español+inglés
+    text, conf = run_ocr_multi(crop)
     text = postprocess_name(text)
     return text, conf
 
@@ -447,7 +479,7 @@ def process_pdf(pdf_bytes: bytes) -> ExtractResult:
 
     # 2) Comprobación de legibilidad OCR mínima (política de rechazo 400)
     sample = pages[0]
-    sample_text, conf = run_ocr(sample, psm=6, lang="spa")
+    sample_text, conf = run_ocr(sample, psm=6, lang="spa+eng")
     if len(sample_text) < 20:  # umbral bajo pero evita binarios/escaneos ilegibles
         raise HTTPException(status_code=400, detail="El PDF no contiene texto OCR legible o metadatos reconocibles para su análisis.")
 
@@ -511,7 +543,7 @@ def process_pdf(pdf_bytes: bytes) -> ExtractResult:
         name, conf = ocr_name_near(bgr, nb["bbox"])
         # Heurística de segunda línea: intentar leer justo debajo de la caja
         x, y, w, h = nb["bbox"]
-        line2_box = (x, y + h, w, int(h * 0.7))
+        line2_box = (x - int(0.2*w), y + h, int(w*1.4), int(h * 1.0))
         l2_name, l2_conf = ocr_name_near(bgr, line2_box)
         combined = maybe_concat_second_line([name, l2_name]) if name else l2_name
         final = postprocess_name(combined or name or l2_name)
@@ -607,4 +639,5 @@ def health():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
+
 
