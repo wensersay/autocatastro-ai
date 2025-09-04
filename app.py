@@ -1,24 +1,22 @@
 """
-app.py — autoCata v0.8.3 (expand-diagonals + propercase)
+app.py — autoCata v0.8.4 (diag→cardinals always + name reorder)
 
-Objetivo: mejorar fidelidad de rumbos y nombres sin perder velocidad:
-- Expansión de diagonales a cardinales contiguos (SE→E+S, NE→N+E, etc.)
-  *si los cardinales están vacíos*; opcionalmente se puede anular la diagonal si ambos cardinales ya se rellenan.
-- Normalización de nombres a **Nombre Apellidos** con **tildes españolas** más comunes (José, Rodríguez, Álvarez, López, Fernández, Vázquez...).
-- `owners_detected` ahora incluye también los nombres del pipeline por filas.
+Mejoras sobre 0.8.3 para fidelidad con tus casos reales:
+- **Diagonales ⇒ Cardinales (siempre)**: todo vecino en NE/SE/SO/NO se replica a sus dos cardinales contiguos
+  (N/E, E/S, S/O, O/N), aunque ya haya nombres en esos lados. Las diagonales se vacían tras expandir.
+- **Reordenado de nombre**: si el patrón OCR viene como «Apellidos Apellidos Nombre», lo convertimos a
+  «Nombre Apellidos Apellidos» usando un set de **nombres de pila comunes** (JOSE, MARIA, LUIS, etc.).
+- `owners_detected` ya integra ambos pipelines.
 
-Sigue heredando de 0.8.2:
-- Presupuesto de tiempo por request (`EDGE_BUDGET_MS`, por defecto 25 s) para evitar 502 en Railway.
-- Fast-path con `FAST_MODE=1` (raster a `DPI_FAST=220` y OCR solo en recortes), DPI por defecto 320.
-- Doble pipeline (map_based + row_based), 8 rumbos, fusión y notarial_text.
+Sigue heredando:
+- Fast-path con `FAST_MODE=1`, `DPI_FAST=220`, `PDF_DPI=320`, presupuesto de tiempo `EDGE_BUDGET_MS` (25 s).
+- Doble pipeline (map_based + row_based), 8 rumbos, fusión y `notarial_text`.
 
-Variables útiles (todas opcionales)
-- AUTH_TOKEN
-- FAST_MODE=1, PDF_DPI=320, DPI_FAST=220, EDGE_BUDGET_MS=25000
-- ROW_OWNER_LINES=2, SECOND_LINE_FORCE=1
-- NEIGH_MIN_AREA_HARD=300, NEIGH_MAX_DIST_RATIO=2.0
-- PROPERCASE=1, DIAG_TO_CARDINALS=1
-- DIAG_MODE=1 (añade debug)
+Variables útiles (todas opcionales):
+- `FAST_MODE=1`, `PDF_DPI=320`, `DPI_FAST=220`, `EDGE_BUDGET_MS=25000`
+- `ROW_OWNER_LINES=2`, `SECOND_LINE_FORCE=1`, `SECOND_LINE_MAXCHARS=32`, `SECOND_LINE_MAXTOKENS=6`
+- `NEIGH_MIN_AREA_HARD=300`, `NEIGH_MAX_DIST_RATIO=2.2`
+- `PROPERCASE=1`, `DIAG_TO_CARDINALS=1`, `DIAG_MODE=1`
 """
 from __future__ import annotations
 
@@ -48,7 +46,7 @@ try:
 except Exception:
     OpenAI = None  # type: ignore
 
-__version__ = "0.8.3"
+__version__ = "0.8.4"
 
 # ----------------------------------------
 # Configuración
@@ -70,13 +68,13 @@ class Cfg:
     name_hints_file: Optional[str] = os.getenv("NAME_HINTS_FILE")
 
     second_line_force: bool = os.getenv("SECOND_LINE_FORCE", "1") == "1"
-    second_line_maxchars: int = int(os.getenv("SECOND_LINE_MAXCHARS", "28"))
-    second_line_maxtokens: int = int(os.getenv("SECOND_LINE_MAXTOKENS", "5"))
+    second_line_maxchars: int = int(os.getenv("SECOND_LINE_MAXCHARS", "32"))
+    second_line_maxtokens: int = int(os.getenv("SECOND_LINE_MAXTOKENS", "6"))
     second_line_strict: bool = os.getenv("SECOND_LINE_STRICT", "0") == "1"
 
     neigh_min_area_hard: int = int(os.getenv("NEIGH_MIN_AREA_HARD", "600"))
     row_band_frac: float = float(os.getenv("ROW_BAND_FRAC", "0.25"))
-    neigh_max_dist_ratio: float = float(os.getenv("NEIGH_MAX_DIST_RATIO", "2.0"))
+    neigh_max_dist_ratio: float = float(os.getenv("NEIGH_MAX_DIST_RATIO", "2.2"))
 
     row_owner_lines: int = int(os.getenv("ROW_OWNER_LINES", "2"))
 
@@ -85,11 +83,9 @@ class Cfg:
     reorder_to_nombre_apellidos: bool = os.getenv("REORDER_TO_NOMBRE_APELLIDOS", "1") == "1"
     reorder_min_conf: int = int(os.getenv("REORDER_MIN_CONF", "70"))
 
-    # Mejoras nuevas
     propercase: bool = os.getenv("PROPERCASE", "1") == "1"
     diag_to_cardinals: bool = os.getenv("DIAG_TO_CARDINALS", "1") == "1"
 
-    # Presupuesto de tiempo en ms para evitar 502 del edge
     edge_budget_ms: int = int(os.getenv("EDGE_BUDGET_MS", "25000"))
 
 CFG = Cfg()
@@ -180,12 +176,9 @@ def run_ocr(img_bgr: np.ndarray, psm: int = 6, lang: str = "spa+eng") -> Tuple[s
 def run_ocr_multi(img_bgr: np.ndarray) -> Tuple[str, float]:
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     gray = cv2.bilateralFilter(gray, 5, 60, 60)
-    # variantes ligeras
-    outs: List[np.ndarray] = []
     _, thr2 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    outs.append(cv2.cvtColor(thr2, cv2.COLOR_GRAY2BGR))
     _, thr3 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    outs.append(cv2.cvtColor(255 - thr3, cv2.COLOR_GRAY2BGR))
+    outs = [cv2.cvtColor(thr2, cv2.COLOR_GRAY2BGR), cv2.cvtColor(255 - thr3, cv2.COLOR_GRAY2BGR)]
     best_text, best_conf = "", 0.0
     for v in outs:
         for psm in (6, 7):
@@ -195,7 +188,7 @@ def run_ocr_multi(img_bgr: np.ndarray) -> Tuple[str, float]:
     return best_text, best_conf
 
 # ----------------------------------------
-# PDF → imagen (respeta presupuesto)
+# PDF → imagen
 # ----------------------------------------
 
 def load_map_page_bgr(pdf_bytes: bytes, budget: float) -> np.ndarray:
@@ -273,7 +266,7 @@ def angle_to_8(ang: float) -> str:
     return "sureste"
 
 # ----------------------------------------
-# Normalización de nombres (tildes + título)
+# Normalización de nombres (tildes + título + reorden)
 # ----------------------------------------
 
 LOWER_CONNECTORS = {"de","del","la","las","los","y","da","do","das","dos"}
@@ -291,6 +284,7 @@ ACCENT_MAP = {
     "GARCIA": "García",
     "NUNEZ": "Núñez",
 }
+GIVEN_NAMES = {"JOSE","JOSÉ","MARIA","MARÍA","LUIS","ANTONIO","MANUEL","ANA","JUAN","CARLOS","PABLO","ROGELIO","FRANCISCO","MARTA","ELENA","LAURA"}
 CORP_RE = re.compile(r"^(S\.?L\.?|S\.?A\.?|SCOOP\.?|COOP\.?|CB)$", re.I)
 
 def strip_accents(s: str) -> str:
@@ -313,9 +307,18 @@ def propercase_spanish(s: str) -> str:
         if up.lower() in LOWER_CONNECTORS:
             out.append(up.lower())
             continue
-        # Título genérico
         out.append(raw.capitalize())
     return " ".join(out)
+
+
+def reorder_surname_first(s: str) -> str:
+    # si el último token es un nombre de pila típico, pásalo delante
+    toks = s.split()
+    if len(toks) >= 2:
+        last = strip_accents(toks[-1]).upper()
+        if last in GIVEN_NAMES:
+            return toks[-1] + " " + " ".join(toks[:-1])
+    return s
 
 # ----------------------------------------
 # Limpieza de candidatos
@@ -333,6 +336,7 @@ def postprocess_name(text: str) -> str:
     s = re.sub(r"\b(TITULAR EN INVESTIGACION|TITULAR EN INVESTIGACIÓN)\b", "Titular en investigación", s, flags=re.I)
     if CFG.propercase:
         s = propercase_spanish(s)
+    s = reorder_surname_first(s)
     return s
 
 
@@ -377,7 +381,6 @@ def maybe_concat_second_line(lines: List[str]) -> str:
 # ----------------------------------------
 
 def run_ocr_multi_near(bgr: np.ndarray) -> Tuple[str, float]:
-    # helper que aplica postprocesos propios
     t, c = run_ocr_multi(bgr)
     t = clean_candidate_text(postprocess_name(t))
     return t, c
@@ -656,7 +659,7 @@ def detect_rows_and_extract8(bgr: np.ndarray) -> Tuple[Dict[str,List[str]], dict
     return ldr, {"rows": rows_dbg, "used_rows": used_rows}
 
 # ----------------------------------------
-# Notarial (plantilla)
+# Notarial
 # ----------------------------------------
 
 def generate_notarial_text(extracted: Dict) -> str:
@@ -673,7 +676,7 @@ def generate_notarial_text(extracted: Dict) -> str:
     return f"Linda: {sides_text}." if sides_text else "No se han podido determinar linderos suficientes para una redacción notarial fiable."
 
 # ----------------------------------------
-# Fusión + expansión de diagonales
+# Fusión + expansión de diagonales (siempre)
 # ----------------------------------------
 
 def expand_diagonals_to_cardinals(ldr: Dict[str, List[str]]) -> Dict[str, List[str]]:
@@ -687,24 +690,21 @@ def expand_diagonals_to_cardinals(ldr: Dict[str, List[str]]) -> Dict[str, List[s
     }
     for diag, (a, b) in mapping.items():
         for nm in list(ldr.get(diag, [])):
-            if nm and (not ldr[a] or nm in ldr[a]):
-                if nm not in ldr[a]: ldr[a].append(nm)
-            if nm and (not ldr[b] or nm in ldr[b]):
-                if nm not in ldr[b]: ldr[b].append(nm)
-            # si ambos cardinales quedan con datos y son consistentes, opcionalmente vaciamos la diagonal
-            if ldr[a] and ldr[b]:
-                # eliminar duplicados exactos en diagonal
-                ldr[diag] = [x for x in ldr[diag] if x not in (ldr[a] + ldr[b])]
+            if nm and nm not in ldr[a]:
+                ldr[a].append(nm)
+            if nm and nm not in ldr[b]:
+                ldr[b].append(nm)
+        # limpiar diagonal tras expandir
+        ldr[diag] = []
     return ldr
 
 # ----------------------------------------
-# Proceso por PDF
+# Proceso principal
 # ----------------------------------------
 
 def process_pdf(pdf_bytes: bytes) -> ExtractResult:
-    t0 = time.perf_counter(); budget_ms = float(CFG.edge_budget_ms)
     # Raster
-    bgr = load_map_page_bgr(pdf_bytes, budget=budget_ms)
+    bgr = load_map_page_bgr(pdf_bytes, budget=float(CFG.edge_budget_ms))
 
     # Gate OCR ligero
     sample_text, _ = run_ocr(bgr, psm=6, lang="spa+eng")
@@ -749,7 +749,7 @@ def process_pdf(pdf_bytes: bytes) -> ExtractResult:
                 ldr_map[side].append(final)
                 owners_detected_union.append(final)
 
-    # Pipeline row_based (LEGACY mejorado)
+    # Pipeline row_based
     ldr_row, rows_dbg = detect_rows_and_extract8(bgr)
     for side, arr in ldr_row.items():
         for nm in arr:
@@ -766,7 +766,7 @@ def process_pdf(pdf_bytes: bytes) -> ExtractResult:
                 if nm_pp and nm_pp not in seen:
                     ldr_out[side].append(nm_pp); seen.add(nm_pp)
 
-    # Expansión de diagonales a cardinales contiguos
+    # Expansión de diagonales a cardinales (siempre)
     ldr_out = expand_diagonals_to_cardinals(ldr_out)
 
     ldr_model = Linderos(**ldr_out)
