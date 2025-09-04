@@ -91,8 +91,7 @@ class Cfg:
     fast_mode: bool = os.getenv("FAST_MODE", "0") == "1"
 
     text_only: bool = os.getenv("TEXT_ONLY", "0") == "1"
-
-       name_hints: List[str] = field(default_factory=lambda: [s.strip() for s in os.getenv("NAME_HINTS", "").split("|") if s.strip()])
+    name_hints: List[str] = field(default_factory=lambda: [s.strip() for s in os.getenv("NAME_HINTS", "").split("|") if s.strip()])
     name_hints_file: Optional[str] = os.getenv("NAME_HINTS_FILE")
 
     second_line_force: bool = os.getenv("SECOND_LINE_FORCE", "0") == "1"
@@ -244,7 +243,7 @@ def run_ocr_multi(img_bgr: np.ndarray) -> Tuple[str, float]:
 # Conversión PDF → imágenes
 # ----------------------------------------
 
-def pdf_to_images(pdf_bytes: bytes, dpi: Optional[int] = None) -> List[np.ndarray]:(pdf_bytes: bytes, dpi: Optional[int] = None) -> List[np.ndarray]:
+def pdf_to_images(pdf_bytes: bytes, dpi: Optional[int] = None) -> List[np.ndarray]:
     use_dpi = dpi or CFG.pdf_dpi
     images = convert_from_bytes(pdf_bytes, dpi=use_dpi, fmt="png")
     out = []
@@ -639,7 +638,6 @@ def health():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
-
 
 
 
