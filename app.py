@@ -1,6 +1,6 @@
 """
-app.py — autoCata v0.7.0
-Pipeline real: OCR con Tesseract + extracción visual de colindantes + redacción notarial (GPT‑4o)
+app.py — autoCata v0.7.2
+Pipeline real: OCR con Tesseract + extracción visual de colindantes + redacción notarial (GPT-4o)
 
 ▶ Endpoints
 - POST /extract  → procesa 1..5 PDFs de certificaciones catastrales (secuencial)
@@ -15,7 +15,7 @@ Pipeline real: OCR con Tesseract + extracción visual de colindantes + redacció
 
 ▶ Variables de entorno relevantes (todas opcionales salvo AUTH_TOKEN y OPENAI_API_KEY si se usa GPT)
 - AUTH_TOKEN                        → token fijo para Authorization: Bearer <token>
-- OPENAI_API_KEY                    → API key de OpenAI (GPT‑4o)
+- OPENAI_API_KEY                    → API key de OpenAI (GPT-4o)
 - MODEL_NOTARIAL                    → por defecto "gpt-4o-mini"
 - PDF_DPI                           → por defecto 300
 - FAST_MODE                         → "1" para usar umbrales rápidos
@@ -29,16 +29,17 @@ Pipeline real: OCR con Tesseract + extracción visual de colindantes + redacció
 - NEIGH_MIN_AREA_HARD               → área mínima de contorno vecino (px) (p.ej. 1800)
 - SIDE_MAX_DIST_FRAC                → fracción máx. de distancia para asignación a cardinal (0..1)
 - ROW_BAND_FRAC                     → fracción de banda superior/inferior para Norte/Sur (fallback)
+- NEIGH_MAX_DIST_RATIO              → ratio de distancia para filtrar cartelas lejanas (por defecto 1.4)
 - AUTO_DPI, FAST_DPI, SLOW_DPI      → perfiles opcionales de DPI
 - DIAG_MODE                         → "1" adjunta datos debug (cajas, puntos, etc.)
 - REORDER_TO_NOMBRE_APELLIDOS       → "1" reordena a Nombre Apellidos si detecta "APELLIDOS, NOMBRE"
 - REORDER_MIN_CONF                  → confianza mínima OCR 0..100 para reordenar
 
-▶ Cumplimiento de requisitos marcados por el usuario (2025‑09‑03)
+▶ Cumplimiento de requisitos marcados por el usuario (2025-09-03)
 1) Redacción notarial en JSON (campo notarial_text) y además como archivo .txt descargable
 2) Si el PDF no contiene OCR/metadata legibles → error 400 explicando el motivo
 3) Todo gestionado desde /extract; límite 5 PDFs por subida; procesamiento secuencial
-4) Uso exclusivo de GPT‑4o para redacción notarial (si hay API key); plantilla local si no
+4) Uso exclusivo de GPT-4o para redacción notarial (si hay API key); plantilla local si no
 5) Integración con tokens fijos (Bearer AUTH_TOKEN) para WordPress plugin
 
 """
@@ -72,7 +73,7 @@ try:
 except Exception:  # paquete no instalado
     OpenAI = None  # type: ignore
 
-__version__ = "0.7.1"
+__version__ = "0.7.2"
 
 # ----------------------------------------
 # Configuración y utilidades
@@ -91,6 +92,7 @@ class Cfg:
     fast_mode: bool = os.getenv("FAST_MODE", "0") == "1"
 
     text_only: bool = os.getenv("TEXT_ONLY", "0") == "1"
+
     name_hints: List[str] = field(default_factory=lambda: [s.strip() for s in os.getenv("NAME_HINTS", "").split("|") if s.strip()])
     name_hints_file: Optional[str] = os.getenv("NAME_HINTS_FILE")
 
@@ -102,6 +104,7 @@ class Cfg:
     neigh_min_area_hard: int = int(os.getenv("NEIGH_MIN_AREA_HARD", "1200"))
     side_max_dist_frac: float = float(os.getenv("SIDE_MAX_DIST_FRAC", "0.65"))
     row_band_frac: float = float(os.getenv("ROW_BAND_FRAC", "0.25"))
+    neigh_max_dist_ratio: float = float(os.getenv("NEIGH_MAX_DIST_RATIO", "1.4"))
 
     diag_mode: bool = os.getenv("DIAG_MODE", "0") == "1"
 
@@ -224,10 +227,7 @@ def run_ocr_multi(img_bgr: np.ndarray) -> Tuple[str, float]:
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     gray = cv2.bilateralFilter(gray, 5, 60, 60)
     for scale in (1.0, 1.5, 2.0):
-        if scale != 1.0:
-            g = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-        else:
-            g = gray
+        g = gray if scale == 1.0 else cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
         for bgrv in _prepro_variants(g):
             variants.append(bgrv)
 
@@ -246,9 +246,9 @@ def run_ocr_multi(img_bgr: np.ndarray) -> Tuple[str, float]:
 def pdf_to_images(pdf_bytes: bytes, dpi: Optional[int] = None) -> List[np.ndarray]:
     use_dpi = dpi or CFG.pdf_dpi
     images = convert_from_bytes(pdf_bytes, dpi=use_dpi, fmt="png")
-    out = []
+    out: List[np.ndarray] = []
     for im in images:
-        arr = np.array(im)  # RGBA/RGB
+        arr = np.array(im)  # RGBA/RGB/gris
         if arr.ndim == 2:
             arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
         elif arr.shape[2] == 4:
@@ -368,6 +368,32 @@ def assign_orientations(subject_c: Tuple[int, int], neighbors: List[Dict]) -> Di
 # OCR de nombres en entorno del contorno
 # ----------------------------------------
 
+def clean_candidate_text(s: str) -> str:
+    if not s:
+        return ""
+    s = re.sub(r"[^0-9A-Za-zÁÉÍÓÚÜÑáéíóúüñ .'-]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip(" .-'")
+    up = s.upper()
+    for ch in ["=", "*", "_", "/", "\\", "|", "[", "]", "{", "}", "<", ">"]:
+        if ch in up:
+            return ""
+    STOP = {"DATOS","ESCALA","LEYENDA","MAPA","COORDENADAS","COORD","REFERENCIA","CATASTRAL","PARCELA","POLIGONO","POLÍGONO","HOJA","AHORA","NORTE","SUR","ESTE","OESTE"}
+    for kw in STOP:
+        if kw in up:
+            return ""
+    companies = ["S.L","S.A","CB","S COOP","S.COOP","SCOOP"]
+    if any(c in up for c in companies):
+        return s
+    for hint in NAME_HINTS:
+        if hint and hint.lower() in s.lower():
+            return s
+    tokens = s.split()
+    good = [t for t in tokens if (len(t) >= 2 and (t.isupper() or t.istitle()))]
+    if len(good) >= 2:
+        return " ".join(tokens[:6])
+    return ""
+
+
 def ocr_name_near(bgr: np.ndarray, bbox: Tuple[int, int, int, int]) -> Tuple[str, float]:
     x, y, w, h = bbox
     pad = int(max(10, 0.10 * max(w, h)))
@@ -380,7 +406,7 @@ def ocr_name_near(bgr: np.ndarray, bbox: Tuple[int, int, int, int]) -> Tuple[str
 
     # OCR multi-intento (varios preprocesados y PSM), español+inglés
     text, conf = run_ocr_multi(crop)
-    text = postprocess_name(text)
+    text = clean_candidate_text(postprocess_name(text))
     return text, conf
 
 
@@ -416,7 +442,7 @@ def maybe_concat_second_line(lines: List[str]) -> str:
 
 
 # ----------------------------------------
-# Redacción notarial con GPT‑4o
+# Redacción notarial con GPT-4o
 # ----------------------------------------
 
 def generate_notarial_text(extracted: Dict) -> str:
@@ -508,8 +534,6 @@ def process_pdf(pdf_bytes: bytes) -> ExtractResult:
         # Fallback por filas (arriba es Norte, abajo Sur). Sirve para casos sin color marcados
         H, W = bgr.shape[:2]
         band = int(H * CFG.row_band_frac)
-        top_band = (0, 0, W, band)
-        bot_band = (0, H - band, W, band)
         # OCR bandas
         top_txt, _ = run_ocr(bgr[0:band, :, :], psm=6)
         bot_txt, _ = run_ocr(bgr[H - band:H, :, :], psm=6)
@@ -530,6 +554,18 @@ def process_pdf(pdf_bytes: bytes) -> ExtractResult:
             files=files,
         )
 
+    # Filtra vecinos alejados del bbox de la parcela principal (evita cartelas/leyendas)
+    sx, sy, sw, sh = subj["bbox"]
+
+    def _dist_to_rect(cx: int, cy: int, rect: Tuple[int, int, int, int]) -> float:
+        x, y, w, h = rect
+        dx = max(x - cx, 0, cx - (x + w))
+        dy = max(y - cy, 0, cy - (y + h))
+        return math.hypot(dx, dy)
+
+    maxd = CFG.neigh_max_dist_ratio * max(sw, sh)
+    neigh = [nb for nb in neigh if _dist_to_rect(nb["centroid"][0], nb["centroid"][1], subj["bbox"]) <= maxd]
+
     subj_c = subj["centroid"]
     idx_by_side = assign_orientations(subj_c, neigh)
 
@@ -546,6 +582,7 @@ def process_pdf(pdf_bytes: bytes) -> ExtractResult:
         l2_name, l2_conf = ocr_name_near(bgr, line2_box)
         combined = maybe_concat_second_line([name, l2_name]) if name else l2_name
         final = postprocess_name(combined or name or l2_name)
+        final = clean_candidate_text(final)
 
         if final:
             owners_idx_to_name[i] = final
@@ -638,6 +675,7 @@ def health():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
+
 
 
 
