@@ -1,23 +1,24 @@
 """
-app.py — autoCata v0.8.2 (edge-budget, fast-path)
+app.py — autoCata v0.8.3 (expand-diagonals + propercase)
 
-Objetivo: evitar 502 por timeout en Railway ajustando el coste por petición.
-Cambios clave respecto 0.8.0/0.8.1:
-- Nuevo presupuesto de tiempo por request: EDGE_BUDGET_MS (por defecto 25000 ms).
-- Fast-path real: si FAST_MODE=1, raster a baja resolución (DPI_FAST=220)
-  y solo se reescala localmente los recortes para OCR.
-- DPI por defecto bajado a 320 (sobre-escribible con PDF_DPI).
-- convert_from_bytes con first/last page y thread_count=1 para estabilidad.
-- Ruta raíz "/" para healthchecks genéricos además de "/health".
-- Pequeñas podas en OCR y morfología para acelerar.
+Objetivo: mejorar fidelidad de rumbos y nombres sin perder velocidad:
+- Expansión de diagonales a cardinales contiguos (SE→E+S, NE→N+E, etc.)
+  *si los cardinales están vacíos*; opcionalmente se puede anular la diagonal si ambos cardinales ya se rellenan.
+- Normalización de nombres a **Nombre Apellidos** con **tildes españolas** más comunes (José, Rodríguez, Álvarez, López, Fernández, Vázquez...).
+- `owners_detected` ahora incluye también los nombres del pipeline por filas.
 
-Sigue manteniendo:
-- 8 rumbos (N, NE, E, SE, S, SO, O, NO), doble pipeline (map_based + row_based), fusión y notarial_text.
+Sigue heredando de 0.8.2:
+- Presupuesto de tiempo por request (`EDGE_BUDGET_MS`, por defecto 25 s) para evitar 502 en Railway.
+- Fast-path con `FAST_MODE=1` (raster a `DPI_FAST=220` y OCR solo en recortes), DPI por defecto 320.
+- Doble pipeline (map_based + row_based), 8 rumbos, fusión y notarial_text.
 
-Variables útiles
-- AUTH_TOKEN, FAST_MODE=1, PDF_DPI=320..500, EDGE_BUDGET_MS=25000 (25s),
-  DPI_FAST=220, NEIGH_MIN_AREA_HARD=300..1200, NEIGH_MAX_DIST_RATIO=1.6..2.2,
-  ROW_OWNER_LINES=2, SECOND_LINE_FORCE=1, DIAG_MODE=1
+Variables útiles (todas opcionales)
+- AUTH_TOKEN
+- FAST_MODE=1, PDF_DPI=320, DPI_FAST=220, EDGE_BUDGET_MS=25000
+- ROW_OWNER_LINES=2, SECOND_LINE_FORCE=1
+- NEIGH_MIN_AREA_HARD=300, NEIGH_MAX_DIST_RATIO=2.0
+- PROPERCASE=1, DIAG_TO_CARDINALS=1
+- DIAG_MODE=1 (añade debug)
 """
 from __future__ import annotations
 
@@ -28,6 +29,7 @@ import math
 import os
 import re
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -46,7 +48,7 @@ try:
 except Exception:
     OpenAI = None  # type: ignore
 
-__version__ = "0.8.2"
+__version__ = "0.8.3"
 
 # ----------------------------------------
 # Configuración
@@ -67,14 +69,14 @@ class Cfg:
     name_hints: List[str] = field(default_factory=lambda: [s.strip() for s in os.getenv("NAME_HINTS", "").split("|") if s.strip()])
     name_hints_file: Optional[str] = os.getenv("NAME_HINTS_FILE")
 
-    second_line_force: bool = os.getenv("SECOND_LINE_FORCE", "0") == "1"
+    second_line_force: bool = os.getenv("SECOND_LINE_FORCE", "1") == "1"
     second_line_maxchars: int = int(os.getenv("SECOND_LINE_MAXCHARS", "28"))
     second_line_maxtokens: int = int(os.getenv("SECOND_LINE_MAXTOKENS", "5"))
     second_line_strict: bool = os.getenv("SECOND_LINE_STRICT", "0") == "1"
 
     neigh_min_area_hard: int = int(os.getenv("NEIGH_MIN_AREA_HARD", "600"))
     row_band_frac: float = float(os.getenv("ROW_BAND_FRAC", "0.25"))
-    neigh_max_dist_ratio: float = float(os.getenv("NEIGH_MAX_DIST_RATIO", "1.8"))
+    neigh_max_dist_ratio: float = float(os.getenv("NEIGH_MAX_DIST_RATIO", "2.0"))
 
     row_owner_lines: int = int(os.getenv("ROW_OWNER_LINES", "2"))
 
@@ -82,6 +84,10 @@ class Cfg:
 
     reorder_to_nombre_apellidos: bool = os.getenv("REORDER_TO_NOMBRE_APELLIDOS", "1") == "1"
     reorder_min_conf: int = int(os.getenv("REORDER_MIN_CONF", "70"))
+
+    # Mejoras nuevas
+    propercase: bool = os.getenv("PROPERCASE", "1") == "1"
+    diag_to_cardinals: bool = os.getenv("DIAG_TO_CARDINALS", "1") == "1"
 
     # Presupuesto de tiempo en ms para evitar 502 del edge
     edge_budget_ms: int = int(os.getenv("EDGE_BUDGET_MS", "25000"))
@@ -174,7 +180,7 @@ def run_ocr(img_bgr: np.ndarray, psm: int = 6, lang: str = "spa+eng") -> Tuple[s
 def run_ocr_multi(img_bgr: np.ndarray) -> Tuple[str, float]:
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     gray = cv2.bilateralFilter(gray, 5, 60, 60)
-    # solo dos variantes para acelerar
+    # variantes ligeras
     outs: List[np.ndarray] = []
     _, thr2 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     outs.append(cv2.cvtColor(thr2, cv2.COLOR_GRAY2BGR))
@@ -189,37 +195,21 @@ def run_ocr_multi(img_bgr: np.ndarray) -> Tuple[str, float]:
     return best_text, best_conf
 
 # ----------------------------------------
-# PDF → imagen (intenta pág. 2, si no 1). Respetar presupuesto.
+# PDF → imagen (respeta presupuesto)
 # ----------------------------------------
 
 def load_map_page_bgr(pdf_bytes: bytes, budget: float) -> np.ndarray:
-    start = time.perf_counter()
     dpi = CFG.dpi_fast if CFG.fast_mode else CFG.pdf_dpi
-
-    def _convert(dpi_try: int):
-        return convert_from_bytes(pdf_bytes, dpi=dpi_try, first_page=2, last_page=2, thread_count=1)
-
-    pages = []
     try:
-        pages = _convert(dpi)
-    except Exception:
-        pages = []
-    if not pages:
-        # fallback a página 1 con el mismo dpi
-        try:
+        pages = convert_from_bytes(pdf_bytes, dpi=dpi, first_page=2, last_page=2, thread_count=1)
+        if not pages:
             pages = convert_from_bytes(pdf_bytes, dpi=dpi, first_page=1, last_page=1, thread_count=1)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"No se pudo rasterizar el PDF: {e}")
-
-    # si nos pasamos del presupuesto, abortamos pronto
-    elapsed = (time.perf_counter() - start) * 1000.0
-    if elapsed > budget * 0.6:
-        logger.info(f"Raster consumió {elapsed:.0f}ms del presupuesto {budget}ms")
-    arr = np.array(pages[0].convert("RGB"))[:, :, ::-1]
-    return arr
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"No se pudo rasterizar el PDF: {e}")
+    return np.array(pages[0].convert("RGB"))[:, :, ::-1]
 
 # ----------------------------------------
-# Segmentación por color (ligero)
+# Segmentación por color
 # ----------------------------------------
 
 def detect_masks(bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -262,7 +252,7 @@ def contours_and_centroids(mask: np.ndarray) -> List[Dict]:
     return out
 
 # ----------------------------------------
-# Rumbos (8)
+# Rumbos (8) y utilidades
 # ----------------------------------------
 
 def angle_between(p0: Tuple[int, int], p1: Tuple[int, int]) -> float:
@@ -283,7 +273,52 @@ def angle_to_8(ang: float) -> str:
     return "sureste"
 
 # ----------------------------------------
-# Limpieza de nombres y helpers
+# Normalización de nombres (tildes + título)
+# ----------------------------------------
+
+LOWER_CONNECTORS = {"de","del","la","las","los","y","da","do","das","dos"}
+ACCENT_MAP = {
+    "JOSE": "José",
+    "RODRIGUEZ": "Rodríguez",
+    "ALVAREZ": "Álvarez",
+    "LOPEZ": "López",
+    "FERNANDEZ": "Fernández",
+    "VAZQUEZ": "Vázquez",
+    "MARTIN": "Martín",
+    "MARTINEZ": "Martínez",
+    "PEREZ": "Pérez",
+    "GOMEZ": "Gómez",
+    "GARCIA": "García",
+    "NUNEZ": "Núñez",
+}
+CORP_RE = re.compile(r"^(S\.?L\.?|S\.?A\.?|SCOOP\.?|COOP\.?|CB)$", re.I)
+
+def strip_accents(s: str) -> str:
+    return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
+
+def propercase_spanish(s: str) -> str:
+    if not s:
+        return s
+    toks = [t for t in re.split(r"\s+", s.strip()) if t]
+    out: List[str] = []
+    for t in toks:
+        raw = t.strip(".,;:()[]{}")
+        up = strip_accents(raw).upper()
+        if CORP_RE.match(raw):
+            out.append(raw.upper().replace(" ", ""))
+            continue
+        if up in ACCENT_MAP:
+            out.append(ACCENT_MAP[up])
+            continue
+        if up.lower() in LOWER_CONNECTORS:
+            out.append(up.lower())
+            continue
+        # Título genérico
+        out.append(raw.capitalize())
+    return " ".join(out)
+
+# ----------------------------------------
+# Limpieza de candidatos
 # ----------------------------------------
 
 def postprocess_name(text: str) -> str:
@@ -296,6 +331,8 @@ def postprocess_name(text: str) -> str:
             s = f"{parts[1]} {parts[0]}"
     s = s.replace("  ", " ")
     s = re.sub(r"\b(TITULAR EN INVESTIGACION|TITULAR EN INVESTIGACIÓN)\b", "Titular en investigación", s, flags=re.I)
+    if CFG.propercase:
+        s = propercase_spanish(s)
     return s
 
 
@@ -317,7 +354,7 @@ def clean_candidate_text(s: str) -> str:
         if hint and hint.lower() in s.lower():
             return s
     tokens = s.split()
-    good = [t for t in tokens if (len(t) >= 2 and (t.isupper() or t.istitle()))]
+    good = [t for t in tokens if (len(t) >= 2 and (t[0].isupper() or t.isupper()))]
     return " ".join(tokens[:6]) if len(good) >= 2 else ""
 
 
@@ -330,7 +367,7 @@ def maybe_concat_second_line(lines: List[str]) -> str:
     if not CFG.second_line_force:
         return top
     if len(below) <= CFG.second_line_maxchars and len(below.split()) <= CFG.second_line_maxtokens:
-        if CFG.second_line_strict and not re.search(r"[A-ZÁÉÍÓÚÑ]{2,}", below):
+        if CFG.second_line_strict and not re.search(r"[A-ZÁÉÍÓÚÑáéíóú]{2,}", below):
             return top
         return f"{top} {below}"
     return top
@@ -339,6 +376,13 @@ def maybe_concat_second_line(lines: List[str]) -> str:
 # OCR alrededor de vecino + barrido
 # ----------------------------------------
 
+def run_ocr_multi_near(bgr: np.ndarray) -> Tuple[str, float]:
+    # helper que aplica postprocesos propios
+    t, c = run_ocr_multi(bgr)
+    t = clean_candidate_text(postprocess_name(t))
+    return t, c
+
+
 def ocr_name_near(bgr: np.ndarray, bbox: Tuple[int,int,int,int]) -> Tuple[str, float]:
     x, y, w, h = bbox
     pad = int(max(10, 0.18 * max(w, h)))
@@ -346,13 +390,10 @@ def ocr_name_near(bgr: np.ndarray, bbox: Tuple[int,int,int,int]) -> Tuple[str, f
     x0 = max(0, x - pad); y0 = max(0, y - pad)
     x1 = min(W, x + w + pad); y1 = min(H, y + h + pad)
     crop = bgr[y0:y1, x0:x1]
-    # reescala si pequeño
     if max(crop.shape[:2]) < 320:
         fx = 320.0 / max(1, max(crop.shape[:2]))
         crop = cv2.resize(crop, None, fx=fx, fy=fx, interpolation=cv2.INTER_CUBIC)
-    text, conf = run_ocr_multi(crop)
-    text = clean_candidate_text(postprocess_name(text))
-    return text, conf
+    return run_ocr_multi_near(crop)
 
 
 def _clip_rect(x0:int,y0:int,x1:int,y1:int,W:int,H:int) -> Tuple[int,int,int,int]:
@@ -391,8 +432,7 @@ def ocr_label_around_neighbor(bgr: np.ndarray, nb_bbox: Tuple[int,int,int,int], 
         if max(crop.shape[:2]) < 320:
             fx = 320.0 / max(1, max(crop.shape[:2]))
             crop = cv2.resize(crop, None, fx=fx, fy=fx, interpolation=cv2.INTER_CUBIC)
-        t, c = run_ocr_multi(crop)
-        t = clean_candidate_text(postprocess_name(t))
+        t, c = run_ocr_multi_near(crop)
         if not t:
             continue
         if (c > best_conf + 1.0) or (abs(c - best_conf) < 1.0 and len(t) > len(best_text)):
@@ -400,7 +440,7 @@ def ocr_label_around_neighbor(bgr: np.ndarray, nb_bbox: Tuple[int,int,int,int], 
     return best_text, best_conf
 
 # ----------------------------------------
-# Fallback MSER (texto cerca del sujeto)
+# Fallback MSER
 # ----------------------------------------
 
 def find_text_neighbors(bgr: np.ndarray, subject_bbox: Tuple[int,int,int,int]) -> List[Dict]:
@@ -544,7 +584,7 @@ def _extract_owner_from_row(bgr: np.ndarray, row_y: int, lines: int = 2) -> Tupl
     h, w = bgr.shape[:2]
     x_text0 = int(w * 0.30); x_text1 = int(w * 0.96)
     attempts = []
-    for attempt in range(2):  # menos intentos para ahorrar tiempo
+    for attempt in range(2):
         extra_left = attempt * max(16, int(w * 0.02))
         x0_base = max(0, x_text0 - extra_left)
         x0, x1, y0, y1 = _find_header_and_owner_band(bgr, row_y, x0_base, x_text1, lines=lines)
@@ -555,7 +595,7 @@ def _extract_owner_from_row(bgr: np.ndarray, row_y: int, lines: int = 2) -> Tupl
         g = cv2.resize(g, None, fx=1.25, fy=1.25, interpolation=cv2.INTER_CUBIC)
         g = _enhance_gray(g)
         bw, bwi = _binarize(g)
-        WL = "ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÜÑ '"
+        WL = "ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÜÑabcdefghijklmnopqrstuvwxyzáéíóúüñ '"
         variants = [ _ocr_text(bw, 6, WL), _ocr_text(bwi, 6, WL), _ocr_text(bw, 7, WL) ]
         owner = ""
         for txt in variants:
@@ -607,6 +647,8 @@ def detect_rows_and_extract8(bgr: np.ndarray) -> Tuple[Dict[str,List[str]], dict
         if best is not None and best_d < (w*0.28)**2:
             side = angle_to_8(angle_between((mcx, mcy), best))
         owner, roi, attempt_id = _extract_owner_from_row(bgr, row_y=mcy, lines=max(1, CFG.row_owner_lines))
+        if owner:
+            owner = postprocess_name(owner)
         if side and owner:
             if owner not in ldr[side]:
                 ldr[side].append(owner); used_rows += 1
@@ -614,7 +656,7 @@ def detect_rows_and_extract8(bgr: np.ndarray) -> Tuple[Dict[str,List[str]], dict
     return ldr, {"rows": rows_dbg, "used_rows": used_rows}
 
 # ----------------------------------------
-# Notarial
+# Notarial (plantilla)
 # ----------------------------------------
 
 def generate_notarial_text(extracted: Dict) -> str:
@@ -631,16 +673,38 @@ def generate_notarial_text(extracted: Dict) -> str:
     return f"Linda: {sides_text}." if sides_text else "No se han podido determinar linderos suficientes para una redacción notarial fiable."
 
 # ----------------------------------------
-# Proceso principal con presupuesto
+# Fusión + expansión de diagonales
+# ----------------------------------------
+
+def expand_diagonals_to_cardinals(ldr: Dict[str, List[str]]) -> Dict[str, List[str]]:
+    if not CFG.diag_to_cardinals:
+        return ldr
+    mapping = {
+        "noreste": ("norte", "este"),
+        "sureste": ("sur", "este"),
+        "suroeste": ("sur", "oeste"),
+        "noroeste": ("norte", "oeste"),
+    }
+    for diag, (a, b) in mapping.items():
+        for nm in list(ldr.get(diag, [])):
+            if nm and (not ldr[a] or nm in ldr[a]):
+                if nm not in ldr[a]: ldr[a].append(nm)
+            if nm and (not ldr[b] or nm in ldr[b]):
+                if nm not in ldr[b]: ldr[b].append(nm)
+            # si ambos cardinales quedan con datos y son consistentes, opcionalmente vaciamos la diagonal
+            if ldr[a] and ldr[b]:
+                # eliminar duplicados exactos en diagonal
+                ldr[diag] = [x for x in ldr[diag] if x not in (ldr[a] + ldr[b])]
+    return ldr
+
+# ----------------------------------------
+# Proceso por PDF
 # ----------------------------------------
 
 def process_pdf(pdf_bytes: bytes) -> ExtractResult:
     t0 = time.perf_counter(); budget_ms = float(CFG.edge_budget_ms)
     # Raster
     bgr = load_map_page_bgr(pdf_bytes, budget=budget_ms)
-    if (time.perf_counter() - t0)*1000.0 > budget_ms*0.9:
-        ldr_empty = Linderos()
-        return ExtractResult(linderos=ldr_empty, owners_detected=[], notarial_text=generate_notarial_text({"linderos": {}}), note="budget_exceeded_raster", debug=None, files=None)
 
     # Gate OCR ligero
     sample_text, _ = run_ocr(bgr, psm=6, lang="spa+eng")
@@ -657,7 +721,7 @@ def process_pdf(pdf_bytes: bytes) -> ExtractResult:
     ldr_map: Dict[str, List[str]] = {k: [] for k in ("norte","noreste","este","sureste","sur","suroeste","oeste","noroeste")}
     used_method = "none"
     if subj:
-        sx, sy, sw, sh = subj["bbox"]
+        sx, sy, sw, sh =  subj["bbox"]
         def _dist_to_rect(cx: int, cy: int, rect: Tuple[int,int,int,int]) -> float:
             x, y, w, h = rect
             dx = max(x - cx, 0, cx - (x + w))
@@ -684,14 +748,13 @@ def process_pdf(pdf_bytes: bytes) -> ExtractResult:
             if final and final not in ldr_map[side]:
                 ldr_map[side].append(final)
                 owners_detected_union.append(final)
-            if (time.perf_counter() - t0)*1000.0 > budget_ms*0.85:
-                break
 
-    # Pipeline row_based (recorta rápido)
-    if (time.perf_counter() - t0)*1000.0 <= budget_ms*0.9:
-        ldr_row, rows_dbg = detect_rows_and_extract8(bgr)
-    else:
-        ldr_row, rows_dbg = ({k: [] for k in ("norte","noreste","este","sureste","sur","suroeste","oeste","noroeste")}, {"rows": [], "note":"skipped_row_based_budget"})
+    # Pipeline row_based (LEGACY mejorado)
+    ldr_row, rows_dbg = detect_rows_and_extract8(bgr)
+    for side, arr in ldr_row.items():
+        for nm in arr:
+            if nm and nm not in owners_detected_union:
+                owners_detected_union.append(nm)
 
     # Fusión
     ldr_out: Dict[str, List[str]] = {k: [] for k in ("norte","noreste","este","sureste","sur","suroeste","oeste","noroeste")}
@@ -699,8 +762,12 @@ def process_pdf(pdf_bytes: bytes) -> ExtractResult:
         seen = set()
         for src in (ldr_map.get(side, []), ldr_row.get(side, [])):
             for nm in src:
-                if nm and nm not in seen:
-                    ldr_out[side].append(nm); seen.add(nm)
+                nm_pp = postprocess_name(nm)
+                if nm_pp and nm_pp not in seen:
+                    ldr_out[side].append(nm_pp); seen.add(nm_pp)
+
+    # Expansión de diagonales a cardinales contiguos
+    ldr_out = expand_diagonals_to_cardinals(ldr_out)
 
     ldr_model = Linderos(**ldr_out)
     notarial = generate_notarial_text({"linderos": ldr_out})
@@ -752,7 +819,5 @@ def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
-
-
 
 
