@@ -1,29 +1,24 @@
 """
-app.py — autoCata v0.9.1 (smart sectors + grouped notarial)
+app.py — autoCata v0.9.2 (row+color fusion, anti-dirección)
 
-Objetivo: fidelidad notarial sin depender de NAME_HINTS y con decisión correcta
-entre diagonales y cardinales según la **cobertura angular real** del colindante.
+Correcciones sobre 0.9.1 a raíz del caso «74 Marouzas Os Luis 14»:
+- **Fuente de verdad = tabla de “Apellidos y nombre / Razón social”** (row-based).
+  El OCR “cerca del vecino” por color queda como **fallback**. 
+- **Filtro anti-dirección**: descartamos candidatos con dígitos o vocabulario
+  de vía pública (CALLE, RÚA, AVDA, CAMIÑO, KM, Nº, etc.).
+- **Fusión**: se combinan resultados (row primero, color después), sin duplicar.
+- Se mantiene **asignación smart** por cobertura angular (cardinales > diagonal).
+- Redacción **agrupada** por titular («Este y Sur, Fulano») y vaciado de diagonales.
 
-Novedades clave frente a 0.9.0:
-1) **Asignación de sectores inteligente (smart)**: para cada colindante se calcula
-   la cobertura angular (histograma sobre 8 rumbos) muestreando su **contorno**
-   respecto del centroide de la parcela objeto. Reglas (configurables):
-   - Si la pareja de cardinales adyacentes a una diagonal (p.ej. E+S ↔ SE) tiene
-     cobertura suficiente, se asignan **ambos cardinales** y **se vacía la diagonal**.
-   - En caso contrario, si una diagonal domina claramente, se conserva la **diagonal**.
-   - Preferencia general: **cardinales** frente a diagonal cuando hay duda.
-2) **Notarial agrupado por titular**: si un mismo titular ocupa 2+ lados, se 
-   redacta «Este y Sur, Fulano», retirándolo de las listas por lado para no duplicar.
-3) **Debug enriquecido**: por cada vecino OCR se guarda su `coverage` de rumbos.
-
-Variables (Railway → Variables) – valores sugeridos:
+Variables recomendadas (Railway → Variables):
 - FAST_MODE=1, PDF_DPI=320, DPI_FAST=220, EDGE_BUDGET_MS=25000
 - NEIGH_MIN_AREA_HARD=300, NEIGH_MAX_DIST_RATIO=2.2
 - ROW_OWNER_LINES=2, SECOND_LINE_FORCE=1, SECOND_LINE_MAXCHARS=40, SECOND_LINE_MAXTOKENS=8
 - PROPERCASE=1
 - SECTOR_ASSIGN_MODE=smart
 - DIAG_KEEP_DOMINANCE=0.55, CARD_PAIR_MIN_EACH=0.20, CARD_PAIR_MIN_COMBINED=0.50, CARD_SINGLE_MIN=0.30
-- DIAG_TO_CARDINALS=0   # desactivado por defecto: decide el motor «smart»
+- DIAG_TO_CARDINALS=0
+- OWNER_ALLOW_DIGITS=0
 """
 from __future__ import annotations
 
@@ -46,7 +41,7 @@ from pdf2image import convert_from_bytes
 from pydantic import BaseModel, Field
 from PIL import Image
 
-__version__ = "0.9.1"
+__version__ = "0.9.2"
 
 # ----------------------------------------
 # Configuración
@@ -82,6 +77,8 @@ class Cfg:
     card_single_min: float = float(os.getenv("CARD_SINGLE_MIN", "0.30"))
 
     diag_to_cardinals: bool = os.getenv("DIAG_TO_CARDINALS", "0") == "1"
+
+    owner_allow_digits: bool = os.getenv("OWNER_ALLOW_DIGITS", "0") == "1"
 
 CFG = Cfg()
 
@@ -163,11 +160,16 @@ ACCENT_MAP = {
     "FERNANDEZ": "Fernández", "VAZQUEZ": "Vázquez", "MARTIN": "Martín", "MARTINEZ": "Martínez",
     "PEREZ": "Pérez", "GOMEZ": "Gómez", "GARCIA": "García", "NUNEZ": "Núñez",
 }
-GIVEN_NAMES = {"JOSE","JOSÉ","LUIS","MARIA","MARÍA","ANTONIO","MANUEL","ANA","JUAN","CARLOS","PABLO","ROGELIO","FRANCISCO","MARTA","ELENA","LAURA"}
+GIVEN_NAMES = {"JOSE","JOSÉ","LUIS","MARIA","MARÍA","ANTONIO","MANUEL","ANA","JUAN","CARLOS","PABLO","ROGELIO","FRANCISCO","MARTA","ELENA","LAURA","JOSÉ","LUÍS"}
 UPPER_NAME_RE = re.compile(r"^[A-ZÁÉÍÓÚÜÑ][A-ZÁÉÍÓÚÜÑ\s\.'\-]+$", re.UNICODE)
 BAD_TOKENS = {"POLÍGONO","POLIGONO","PARCELA","APELLIDOS","NOMBRE","RAZON","RAZÓN","SOCIAL","NIF","DOMICILIO","LOCALIZACIÓN","LOCALIZACION","REFERENCIA","CATASTRAL","TITULARIDAD","PRINCIPAL"}
 GEO_TOKENS = {"LUGO","BARCELONA","MADRID","VALENCIA","SEVILLA","CORUÑA","A CORUÑA","MONFORTE","LEM","LEMOS","HOSPITALET","L'HOSPITALET","SAVIAO","SAVIÑAO","GALICIA","[LUGO]","[BARCELONA]"}
 NAME_CONNECTORS = {"DE","DEL","LA","LOS","LAS","DA","DO","DAS","DOS","Y"}
+ADDRESS_KWS = {
+    "CALLE","CALLE.","RUA","RÚA","AVDA","AVENIDA","CAMINO","CAMIÑO","LUGAR","PLAZA","PRAZA",
+    "KM","KILOMETRO","KILÓMETRO","Nº","NO.","NUM","NUM.","CODIGO","CÓDIGO","POSTAL","CP","PARROQUIA",
+    "MUNICIPIO","CONCELLO","PROVINCIA","PAIS","PAÍS","ESPAÑA","ESPAÑA","PORTAL","ESCALERA","PISO"
+}
 
 
 def propercase_spanish(s: str) -> str:
@@ -212,26 +214,39 @@ def postprocess_name(text: str) -> str:
     return s
 
 
+def looks_like_address(s: str) -> bool:
+    up = strip_accents(s).upper()
+    if any(kw in up for kw in ADDRESS_KWS):
+        return True
+    if re.search(r"\b\d{1,4}\b", up):  # número suelto típico de portal/km
+        return True
+    return False
+
+
 def clean_candidate_text(s: str) -> str:
     if not s:
         return ""
     s = re.sub(r"[^0-9A-Za-zÁÉÍÓÚÜÑáéíóúüñ .'-]", " ", s)
     s = re.sub(r"\s+", " ", s).strip(" .-'")
-    up = s.upper()
+    up = strip_accents(s).upper()
     for ch in ["=", "*", "_", "/", "\\", "|", "[", "]", "{", "}", "<", ">"]:
         if ch in up:
             return ""
     STOP = {"DATOS","ESCALA","LEYENDA","MAPA","COORDENADAS","COORD","REFERENCIA","CATASTRAL","PARCELA","POLIGONO","POLÍGONO","HOJA","AHORA","NORTE","SUR","ESTE","OESTE"}
     if any(kw in up for kw in STOP):
         return ""
-    if re.search(r"\b(S\.?:?L\.?(?:\b|$)|S\.?:?A\.?(?:\b|$)|CB\b|S\.?COOP\.?)", s, flags=re.I):
-        return s
+    if looks_like_address(up):
+        return ""
+    if not CFG.owner_allow_digits and re.search(r"\d", up):
+        # permitir sociedades sin números explícitos
+        if not re.search(r"\b(S\.?L\.?|S\.?A\.?|SCOOP\.?|COOP\.?|CB)\b", up):
+            return ""
     tokens = s.split()
     good = [t for t in tokens if (len(t) >= 2 and (t[0].isupper() or t.isupper()))]
     return " ".join(tokens[:7]) if len(good) >= 2 else ""
 
 # ----------------------------------------
-# OCR auxiliares
+# OCR básicos
 # ----------------------------------------
 
 def ocr_image_to_data_lines(img_bgr: np.ndarray) -> List[Tuple[str, Tuple[int,int,int,int]]]:
@@ -242,7 +257,7 @@ def ocr_image_to_data_lines(img_bgr: np.ndarray) -> List[Tuple[str, Tuple[int,in
     lines: Dict[Tuple[int,int], Dict] = {}
     for i in range(n):
         txt = (data["text"][i] or "").strip()
-        conf = data["conf"][i]
+        conf = data.get("conf", [-1]*n)[i]
         try:
             conf = float(conf)
         except Exception:
@@ -272,7 +287,7 @@ def ocr_best_of_three(crop_bgr: np.ndarray) -> str:
     _, thr2 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     _, thr3 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     cands: List[str] = []
-    for im in (cv2.cvtColor(thr2, cv2.COLOR_GRAY2BGR), cv2.cvtColor(255 - thr3, cv2.COLOR_GRAY2BGR)):
+    for im in (cv2.cvtColor(thr2, cv2.COLOR_BGR2BGR), cv2.cvtColor(255 - thr3, cv2.COLOR_GRAY2BGR)):
         txt = pytesseract.image_to_string(Image.fromarray(cv2.cvtColor(im, cv2.COLOR_BGR2RGB)), config="--oem 1 --psm 6 -l spa+eng")
         cands.append(txt or "")
     ln = ocr_image_to_data_lines(crop_bgr)
@@ -297,7 +312,7 @@ def ocr_best_of_three(crop_bgr: np.ndarray) -> str:
     return best
 
 # ----------------------------------------
-# PDF → imagen + máscaras y contornos (con contorno)
+# PDF → imagen + máscaras y contornos
 # ----------------------------------------
 
 def load_map_page_bgr(pdf_bytes: bytes) -> np.ndarray:
@@ -349,7 +364,7 @@ def contours_and_centroids(mask: np.ndarray) -> List[Dict]:
     return out
 
 # ----------------------------------------
-# Cobertura angular y decisión de sectores
+# Cobertura angular y decisión de sectores (smart)
 # ----------------------------------------
 
 SIDES8 = ["este","noreste","norte","noroeste","oeste","suroeste","sur","sureste"]
@@ -379,7 +394,6 @@ def angle_to_8(ang: float) -> str:
 
 
 def sector_coverage(subj_c: Tuple[int,int], contour: np.ndarray, step: int = 8) -> Dict[str, float]:
-    """Devuelve proporción de puntos del contorno en cada rumbo (8)."""
     cnt = contour.reshape(-1, 2)
     n = len(cnt)
     if n == 0:
@@ -395,35 +409,27 @@ def sector_coverage(subj_c: Tuple[int,int], contour: np.ndarray, step: int = 8) 
 
 
 def decide_sides_smart(cov: Dict[str, float]) -> List[str]:
-    """Reglas smart con preferencia por cardinales y limpieza de diagonales si procede."""
-    # 1) ¿Hay una pareja cardinal fuerte para alguna diagonal?
     for diag, (a, b) in PAIRS.items():
         if cov[a] >= CFG.card_pair_min_each and cov[b] >= CFG.card_pair_min_each and (cov[a] + cov[b]) >= CFG.card_pair_min_combined:
-            return [a, b]  # cardinales preferidos
-    # 2) ¿Alguna diagonal domina claramente?
+            return [a, b]
     best_side = max(SIDES8, key=lambda s: cov.get(s, 0.0))
     if best_side in PAIRS:
         a, b = PAIRS[best_side]
         if cov[best_side] >= CFG.diag_keep_dominance and cov[a] < CFG.card_pair_min_each and cov[b] < CFG.card_pair_min_each:
-            return [best_side]  # diagonal fuerte
-    # 3) ¿Dos cardinales medianamente fuertes contiguos?
-    cardinales = ["norte","este","sur","oeste"]
+            return [best_side]
+    card_pairs = [("norte","este"),("este","sur"),("sur","oeste"),("oeste","norte")]
     best_pair: Optional[Tuple[str,str]] = None
     best_sum = 0.0
-    adj = {"norte":["noreste","noroeste"], "este":["noreste","sureste"], "sur":["sureste","suroeste"], "oeste":["noroeste","suroeste"]}
-    # pares cardinales adyacentes válidos
-    card_pairs = [("norte","este"),("este","sur"),("sur","oeste"),("oeste","norte")]
     for a,b in card_pairs:
         s = cov[a] + cov[b]
         if cov[a] >= CFG.card_single_min and cov[b] >= CFG.card_single_min and s > best_sum:
             best_sum = s; best_pair = (a,b)
     if best_pair:
         return list(best_pair)
-    # 4) último recurso: el mejor sector (cardinal o diagonal)
     return [best_side]
 
 # ----------------------------------------
-# OCR cerca del vecino con line-joiner
+# OCR cerca del vecino (fallback)
 # ----------------------------------------
 
 def ocr_name_near_with_linejoin(bgr: np.ndarray, bbox: Tuple[int,int,int,int], subj_c: Tuple[int,int]) -> str:
@@ -461,7 +467,7 @@ def ocr_name_near_with_linejoin(bgr: np.ndarray, bbox: Tuple[int,int,int,int], s
     return best
 
 # ----------------------------------------
-# Row-based (heredado, mantiene lado por ángulo simple)
+# Row-based mejorado (2 líneas)
 # ----------------------------------------
 
 def _binarize(gray: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -474,7 +480,191 @@ def _enhance_gray(g: np.ndarray) -> np.ndarray:
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
     return clahe.apply(g)
 
-# (Se mantiene la lógica de filas de 0.9.0 por estabilidad)
+
+def _ocr_text(img: np.ndarray, psm: int, whitelist: Optional[str] = None) -> str:
+    cfg = f"--psm {psm} --oem 3"
+    if whitelist is not None:
+        safe = (whitelist or "").replace('"','')
+        cfg += f' -c tessedit_char_whitelist="{safe}"'
+    txt = pytesseract.image_to_string(img, config=cfg) or ""
+    txt = txt.replace("\r", "\n")
+    txt = re.sub(r"[ \t]+", " ", txt)
+    txt = re.sub(r"\n{2,}", "\n", txt)
+    return txt.strip()
+
+
+def _clean_owner_line(line: str) -> str:
+    if not line:
+        return ""
+    toks = [t for t in re.split(r"[^\wÁÉÍÓÚÜÑ'-]+", line.upper()) if t]
+    out = []
+    for t in toks:
+        if any(ch.isdigit() for ch in t): break
+        if t in GEO_TOKENS or "[" in t or "]" in t: break
+        if t in BAD_TOKENS: continue
+        out.append(t)
+        if len([x for x in out if x not in NAME_CONNECTORS]) >= 7:
+            break
+    compact = []
+    for t in out:
+        if (not compact) and t in NAME_CONNECTORS:
+            continue
+        compact.append(t)
+    name = " ".join(compact).strip()
+    return name[:80]
+
+
+def _pick_owner_from_text(txt: str) -> str:
+    if not txt:
+        return ""
+    lines = [l.strip() for l in txt.split("\n") if l.strip()]
+    for l in lines:
+        U = l.upper()
+        if any(tok in U for tok in BAD_TOKENS):
+            continue
+        if sum(ch.isdigit() for ch in U) > 0:
+            continue
+        if not UPPER_NAME_RE.match(U):
+            continue
+        name = _clean_owner_line(U)
+        if len(name) >= 6:
+            return name
+    return ""
+
+
+def _find_header_and_owner_band(bgr: np.ndarray, row_y: int, x_text0: int, x_text1: int, lines: int = 2) -> Tuple[int,int,int,int]:
+    h, w = bgr.shape[:2]
+    pad_y = int(h * 0.06)
+    y0s = max(0, row_y - pad_y)
+    y1s = min(h, row_y + pad_y)
+    band = bgr[y0s:y1s, x_text0:x_text1]
+    if band.size == 0:
+        lh = int(h * (0.035 if lines == 1 else 0.06))
+        y0 = max(0, row_y - int(h*0.012)); y1 = min(h, y0 + lh)
+        return x_text0, int(x_text0 + 0.58*(x_text1-x_text0)), y0, y1
+    gray = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
+    bw, bwi = _binarize(gray)
+    for im in (bw, bwi):
+        data = pytesseract.image_to_data(im, output_type=pytesseract.Output.DICT, config="--psm 6 --oem 3")
+        words = data.get("text", []); xs = data.get("left", []); ys = data.get("top", []); ws = data.get("width", []); hs = data.get("height", [])
+        x_nif = None; header_bottom = None
+        for t, lx, ty, ww, hh in zip(words, xs, ys, ws, hs):
+            if not t: continue
+            T = t.upper()
+            if "APELLIDOS" in T: header_bottom = max(header_bottom or 0, ty + hh)
+            if T == "NIF": x_nif = lx; header_bottom = max(header_bottom or 0, ty + hh)
+        if header_bottom is not None:
+            y0 = y0s + header_bottom + 6
+            lh = int(h * (0.035 if lines == 1 else 0.06))
+            y1 = min(h, y0 + lh)
+            if x_nif is not None:
+                x0 = x_text0; x1 = min(x_text1, x_text0 + x_nif - 8)
+            else:
+                x0 = x_text0; x1 = int(x_text0 + 0.58*(x_text1-x_text0))
+            if x1 - x0 > (x_text1 - x_text0) * 0.22:
+                return x0, x1, y0, y1
+    lh = int(h * (0.035 if lines == 1 else 0.06))
+    y0 = max(0, row_y - int(h*0.012)); y1 = min(h, y0 + lh)
+    x0 = x_text0; x1 = int(x_text0 + 0.58*(x_text1-x_text0))
+    return x0, x1, y0, y1
+
+
+def _extract_owner_from_row(bgr: np.ndarray, row_y: int, lines: int = 2) -> Tuple[str, Tuple[int,int,int,int], int]:
+    h, w = bgr.shape[:2]
+    x_text0 = int(w * 0.30); x_text1 = int(w * 0.96)
+    attempts = []
+    for attempt in range(2):
+        extra_left = attempt * max(16, int(w * 0.02))
+        x0_base = max(0, x_text0 - extra_left)
+        x0, x1, y0, y1 = _find_header_and_owner_band(bgr, row_y, x0_base, x_text1, lines=lines)
+        roi = bgr[y0:y1, x0:x1]
+        if roi.size == 0:
+            attempts.append((attempt, x0,y0,x1,y1, "")); continue
+        g = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        g = cv2.resize(g, None, fx=1.25, fy=1.25, interpolation=cv2.INTER_CUBIC)
+        g = _enhance_gray(g)
+        bw, bwi = _binarize(g)
+        WL = "ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÜÑabcdefghijklmnopqrstuvwxyzáéíóúüñ '"
+        variants = [ _ocr_text(bw, 6, WL), _ocr_text(bwi, 6, WL), _ocr_text(bw, 7, WL) ]
+        owner = ""
+        for txt in variants:
+            owner = _pick_owner_from_text(txt)
+            if owner:
+                break
+        if not owner:
+            rgb = cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
+            lines_data = ocr_image_to_data_lines(rgb)
+            if lines_data:
+                joined = lines_data[0][0]
+                if len(lines_data) >= 2:
+                    below = lines_data[1][0].strip()
+                    if 0 < len(below) <= CFG.second_line_maxchars and len(below.split()) <= CFG.second_line_maxtokens:
+                        joined = f"{joined} {below}"
+                owner = _pick_owner_from_text(joined)
+        owner = clean_candidate_text(postprocess_name(owner))
+        attempts.append((attempt, x0,y0,x1,y1, owner))
+        if owner and len(owner) >= 6:
+            return owner, (x0,y0,x1,y1), attempt
+    best = max(attempts, key=lambda t: len(t[5]) if t[5] else 0)
+    return best[5], (best[1],best[2],best[3],best[4]), best[0]
+
+
+def detect_rows_and_extract8(bgr: np.ndarray) -> Tuple[Dict[str,List[str]], dict]:
+    h, w = bgr.shape[:2]
+    top = int(h * 0.12); bottom = int(h * 0.92)
+    left = int(w * 0.06); right = int(w * 0.40)
+    crop = bgr[top:bottom, left:right]
+    # colores
+    def _centroids(mask: np.ndarray, min_area: int) -> List[Tuple[int,int,int]]:
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        out: List[Tuple[int,int,int]] = []
+        for c in cnts:
+            a = cv2.contourArea(c)
+            if a < min_area: continue
+            M = cv2.moments(c)
+            if M["m00"] == 0: continue
+            cx = int(M["m10"] / M["m00"]); cy = int(M["m01"] / M["m00"])
+            out.append((cx, cy, int(a)))
+        out.sort(key=lambda x: -x[2])
+        return out
+    mg, mp = detect_masks(crop)
+    mains  = _centroids(mg, min_area=max(240, CFG.neigh_min_area_hard))
+    neighs = _centroids(mp, min_area=max(180, CFG.neigh_min_area_hard // 2))
+    if not mains:
+        return {k: [] for k in ("norte","noreste","este","sureste","sur","suroeste","oeste","noroeste")}, {"rows": []}
+    mains_abs  = [(cx+left, cy+top, a) for (cx,cy,a) in mains]
+    mains_abs.sort(key=lambda t: t[1])
+    neighs_abs = [(cx+left, cy+top, a) for (cx,cy,a) in neighs]
+    ldr: Dict[str, List[str]] = {k: [] for k in ("norte","noreste","este","sureste","sur","suroeste","oeste","noroeste")}
+    rows_dbg = []
+    used_rows = 0
+    def side_of(main_xy: Tuple[int,int], pt_xy: Tuple[int,int]) -> str:
+        cx, cy = main_xy; x, y = pt_xy
+        sx, sy = x - cx, y - cy
+        ang = math.degrees(math.atan2(-(sy), sx))
+        if -22.5 <= ang <= 22.5: return "este"
+        if 22.5 < ang <= 67.5:  return "noreste"
+        if 67.5 < ang <= 112.5: return "norte"
+        if 112.5 < ang <= 157.5:return "noroeste"
+        if -67.5 <= ang < -22.5:return "sureste"
+        if -112.5 <= ang < -67.5:return "sur"
+        if -157.5 <= ang < -112.5:return "suroeste"
+        return "oeste"
+    for (mcx, mcy, _a) in mains_abs[:8]:
+        best = None; best_d = 1e18
+        for (nx, ny, _na) in neighs_abs:
+            d = (nx-mcx)**2 + (ny-mcy)**2
+            if d < best_d:
+                best_d = d; best = (nx, ny)
+        side = ""
+        if best is not None and best_d < (w*0.28)**2:
+            side = side_of((mcx, mcy), best)
+        owner, _roi, attempt_id = _extract_owner_from_row(bgr, row_y=mcy, lines=max(1, CFG.row_owner_lines))
+        if side and owner:
+            if owner not in ldr[side]:
+                ldr[side].append(owner); used_rows += 1
+        rows_dbg.append({"row_y": mcy, "main_center": [mcx, mcy], "neigh_center": list(best) if best else None, "side": side, "owner": owner, "roi_attempt": attempt_id})
+    return ldr, {"rows": rows_dbg, "used_rows": used_rows}
 
 # ----------------------------------------
 # Notarial agrupado
@@ -497,34 +687,27 @@ def join_sides_spanish(sides: List[str]) -> str:
 
 
 def generate_notarial_text_grouped(owners_by_side: Dict[str, List[str]]) -> str:
-    # Mapa owner -> lados
     owner_sides: Dict[str, List[str]] = {}
     for side in SIDE_ORDER:
         for nm in owners_by_side.get(side, []) or []:
             owner_sides.setdefault(nm, []).append(side)
-    # Retirar nombres agrupados de sus lados originales
     sides_left: Dict[str, List[str]] = {s: [] for s in SIDE_ORDER}
     grouped: List[Tuple[List[str], str]] = []
     for owner, sides in owner_sides.items():
         if len(sides) >= 2:
-            # agrupar este titular
             grouped.append((sorted(sides, key=lambda x: SIDE_ORDER.index(x)), owner))
         else:
             s = sides[0]
             sides_left.setdefault(s, []).append(owner)
-    # Añadir los que queden (con varios por lado)
     for side in SIDE_ORDER:
         for nm in owners_by_side.get(side, []) or []:
             if nm not in owner_sides or len(owner_sides[nm]) == 1:
                 if nm not in sides_left[side]:
                     sides_left[side].append(nm)
-    # Construir texto
     parts: List[str] = []
-    # Primero grupos multi-lado ordenados por el primer lado
     grouped.sort(key=lambda t: SIDE_ORDER.index(t[0][0]))
     for sides, owner in grouped:
         parts.append(f"{join_sides_spanish(sides)}, {owner}")
-    # Luego los restantes por lado
     for side in SIDE_ORDER:
         arr = list(dict.fromkeys(sides_left[side]))
         if not arr:
@@ -542,26 +725,26 @@ def generate_notarial_text_grouped(owners_by_side: Dict[str, List[str]]) -> str:
 def process_pdf(pdf_bytes: bytes) -> ExtractResult:
     bgr = load_map_page_bgr(pdf_bytes)
 
-    # Gate OCR ligero para descartar PDFs mal formados
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     txt_gate = pytesseract.image_to_string(Image.fromarray(rgb), config="--oem 1 --psm 6 -l spa+eng") or ""
     if len(txt_gate.strip()) < 12:
         raise HTTPException(status_code=400, detail="El PDF no contiene texto OCR legible o metadatos reconocibles para su análisis.")
 
-    owners_detected_union: List[str] = []
+    # 1) Row-based (fuente de verdad)
+    ldr_row, rows_dbg = detect_rows_and_extract8(bgr)
 
-    # Pipeline por color (con contorno y decisión smart)
+    # 2) Color-based (con cobertura angular + smart) — fallback/complemento
+    owners_detected_union: List[str] = []
     mask_green, mask_pink = detect_masks(bgr)
     subs = contours_and_centroids(mask_green)
     neigh = contours_and_centroids(mask_pink)
     subj = subs[0] if subs else None
 
-    ldr_out: Dict[str, List[str]] = {k: [] for k in SIDE_ORDER}
+    ldr_color: Dict[str, List[str]] = {k: [] for k in SIDE_ORDER}
     debug_rows: List[Dict] = []
 
     if subj:
         subj_c = subj["centroid"]
-        # filtrar vecinos por distancia al rectángulo de la parcela
         sx, sy, sw, sh = subj["bbox"]
         def dist_to_rect(cx: int, cy: int, rect: Tuple[int,int,int,int]) -> float:
             x, y, w, h = rect
@@ -572,47 +755,47 @@ def process_pdf(pdf_bytes: bytes) -> ExtractResult:
         neigh = [nb for nb in neigh if dist_to_rect(nb["centroid"][0], nb["centroid"][1], subj["bbox"]) <= maxd]
         for nb in neigh[:12]:
             coverage = sector_coverage(subj_c, nb["contour"], step=8)
-            if CFG.sector_assign_mode == "smart":
-                sides = decide_sides_smart(coverage)
-            else:
-                # modo simple por centroide (retrocompatibilidad)
-                ang = angle_between(subj_c, nb["centroid"]) ; sides = [angle_to_8(ang)]
+            sides = decide_sides_smart(coverage) if CFG.sector_assign_mode == "smart" else [angle_to_8(angle_between(subj_c, nb["centroid"]))]
             name = ocr_name_near_with_linejoin(bgr, nb["bbox"], subj_c)
             if not name:
                 continue
             for side in sides:
-                if name not in ldr_out[side]:
-                    ldr_out[side].append(name)
+                if name not in ldr_color[side]:
+                    ldr_color[side].append(name)
             if name not in owners_detected_union:
                 owners_detected_union.append(name)
-            debug_rows.append({
-                "neighbor_bbox": list(nb["bbox"]),
-                "centroid": list(nb["centroid"]),
-                "coverage": coverage,
-                "assigned": sides,
-                "owner": name,
-            })
+            debug_rows.append({"neighbor_bbox": list(nb["bbox"]), "centroid": list(nb["centroid"]), "coverage": coverage, "assigned": sides, "owner": name})
 
-    # Si el flag de expansión está activo, mantener ese comportamiento (no recomendado con smart)
-    if CFG.diag_to_cardinals:
-        for diag, (a, b) in PAIRS.items():
-            for nm in list(ldr_out.get(diag, [])):
-                if nm and nm not in ldr_out[a]:
-                    ldr_out[a].append(nm)
-                if nm and nm not in ldr_out[b]:
-                    ldr_out[b].append(nm)
+    # 3) Fusión (prioridad a row-based)
+    ldr_out: Dict[str, List[str]] = {k: [] for k in SIDE_ORDER}
+    for side in SIDE_ORDER:
+        seen = set()
+        for src in (ldr_row.get(side, []), ldr_color.get(side, [])):
+            for nm in src:
+                nm_pp = clean_candidate_text(postprocess_name(nm))
+                if nm_pp and nm_pp not in seen:
+                    ldr_out[side].append(nm_pp); seen.add(nm_pp)
+
+    # 4) Vaciar diagonales si hay sus dos cardinales presentes (preferencia notarial)
+    for diag, (a, b) in {"noreste": ("norte","este"), "sureste": ("sur","este"), "suroeste": ("sur","oeste"), "noroeste": ("norte","oeste")}.items():
+        if ldr_out[a] and ldr_out[b]:
             ldr_out[diag] = []
 
-    # Notarial agrupado por titular
+    # 5) Notarial agrupado
     notarial = generate_notarial_text_grouped(ldr_out)
-
     files = {"notarial_text.txt": base64.b64encode(notarial.encode("utf-8")).decode("ascii")}
 
-    debug = {"rows": debug_rows, "subject_centroid": list(subj["centroid"]) if subj else None}
+    debug = {"rows": rows_dbg.get("rows", []) + debug_rows, "subject_centroid": list(subs[0]["centroid"]) if subs else None}
+
+    owners_detected = []
+    for side in SIDE_ORDER:
+        for nm in ldr_out[side]:
+            if nm not in owners_detected:
+                owners_detected.append(nm)
 
     return ExtractResult(
         linderos=Linderos(**ldr_out),
-        owners_detected=list(dict.fromkeys(owners_detected_union))[:24],
+        owners_detected=owners_detected[:24],
         notarial_text=notarial,
         note=None,
         debug=debug,
@@ -659,6 +842,7 @@ def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
+
 
 
 
