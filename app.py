@@ -1,22 +1,20 @@
 """
-app.py — autoCata v0.8.4 (diag→cardinals always + name reorder)
+app.py — autoCata v0.8.5 (hints-canonicalization)
 
-Mejoras sobre 0.8.3 para fidelidad con tus casos reales:
-- **Diagonales ⇒ Cardinales (siempre)**: todo vecino en NE/SE/SO/NO se replica a sus dos cardinales contiguos
-  (N/E, E/S, S/O, O/N), aunque ya haya nombres en esos lados. Las diagonales se vacían tras expandir.
-- **Reordenado de nombre**: si el patrón OCR viene como «Apellidos Apellidos Nombre», lo convertimos a
-  «Nombre Apellidos Apellidos» usando un set de **nombres de pila comunes** (JOSE, MARIA, LUIS, etc.).
-- `owners_detected` ya integra ambos pipelines.
+Mejoras sobre 0.8.4:
+- **Canonicalización con NAME_HINTS**: si el OCR devuelve una variante parcial como
+  "José Rodríguez Álvarez" y existe un hint "José Luis Rodríguez Álvarez",
+  autocompleta al canónico. Funciona también para otras grafías.
+- Mantiene: diagonales ⇒ cardinales (siempre), propercase con tildes, reorden
+  "Apellidos Apellidos Nombre" ⇒ "Nombre Apellidos Apellidos", owners_detected
+  consolidado y límites de tiempo para evitar 502.
 
-Sigue heredando:
-- Fast-path con `FAST_MODE=1`, `DPI_FAST=220`, `PDF_DPI=320`, presupuesto de tiempo `EDGE_BUDGET_MS` (25 s).
-- Doble pipeline (map_based + row_based), 8 rumbos, fusión y `notarial_text`.
-
-Variables útiles (todas opcionales):
-- `FAST_MODE=1`, `PDF_DPI=320`, `DPI_FAST=220`, `EDGE_BUDGET_MS=25000`
-- `ROW_OWNER_LINES=2`, `SECOND_LINE_FORCE=1`, `SECOND_LINE_MAXCHARS=32`, `SECOND_LINE_MAXTOKENS=6`
-- `NEIGH_MIN_AREA_HARD=300`, `NEIGH_MAX_DIST_RATIO=2.2`
-- `PROPERCASE=1`, `DIAG_TO_CARDINALS=1`, `DIAG_MODE=1`
+Variables sugeridas (Railway → Variables):
+- FAST_MODE=1, PDF_DPI=320, DPI_FAST=220, EDGE_BUDGET_MS=25000
+- ROW_OWNER_LINES=2, SECOND_LINE_FORCE=1, SECOND_LINE_MAXCHARS=32, SECOND_LINE_MAXTOKENS=6
+- NEIGH_MIN_AREA_HARD=300, NEIGH_MAX_DIST_RATIO=2.2
+- PROPERCASE=1, DIAG_TO_CARDINALS=1
+- NAME_HINTS="José Luis Rodríguez Álvarez|Rogelio Mosquera López|José Varela Fernández|Dosinda Vázquez Pombo"
 """
 from __future__ import annotations
 
@@ -46,7 +44,7 @@ try:
 except Exception:
     OpenAI = None  # type: ignore
 
-__version__ = "0.8.4"
+__version__ = "0.8.5"
 
 # ----------------------------------------
 # Configuración
@@ -188,7 +186,26 @@ def run_ocr_multi(img_bgr: np.ndarray) -> Tuple[str, float]:
     return best_text, best_conf
 
 # ----------------------------------------
-# PDF → imagen
+# NAME_HINTS canonicalization
+# ----------------------------------------
+
+def strip_accents(s: str) -> str:
+    return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
+
+
+def canonicalize_with_hints(s: str) -> str:
+    if not s or not NAME_HINTS:
+        return s
+    up_tokens = strip_accents(s).upper().split()
+    # regla: si todos los tokens del candidato aparecen dentro de algún hint canónico → usar el hint completo
+    for hint in NAME_HINTS:
+        hup = strip_accents(hint).upper().split()
+        if all(t in hup for t in up_tokens if t):
+            return hint
+    return s
+
+# ----------------------------------------
+# PDF → imagen (respeta presupuesto)
 # ----------------------------------------
 
 def load_map_page_bgr(pdf_bytes: bytes, budget: float) -> np.ndarray:
@@ -287,8 +304,6 @@ ACCENT_MAP = {
 GIVEN_NAMES = {"JOSE","JOSÉ","MARIA","MARÍA","LUIS","ANTONIO","MANUEL","ANA","JUAN","CARLOS","PABLO","ROGELIO","FRANCISCO","MARTA","ELENA","LAURA"}
 CORP_RE = re.compile(r"^(S\.?L\.?|S\.?A\.?|SCOOP\.?|COOP\.?|CB)$", re.I)
 
-def strip_accents(s: str) -> str:
-    return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
 
 def propercase_spanish(s: str) -> str:
     if not s:
@@ -312,7 +327,6 @@ def propercase_spanish(s: str) -> str:
 
 
 def reorder_surname_first(s: str) -> str:
-    # si el último token es un nombre de pila típico, pásalo delante
     toks = s.split()
     if len(toks) >= 2:
         last = strip_accents(toks[-1]).upper()
@@ -356,7 +370,7 @@ def clean_candidate_text(s: str) -> str:
         return s
     for hint in NAME_HINTS:
         if hint and hint.lower() in s.lower():
-            return s
+            return hint  # retorno canónico si hay substring match
     tokens = s.split()
     good = [t for t in tokens if (len(t) >= 2 and (t[0].isupper() or t.isupper()))]
     return " ".join(tokens[:6]) if len(good) >= 2 else ""
@@ -383,6 +397,7 @@ def maybe_concat_second_line(lines: List[str]) -> str:
 def run_ocr_multi_near(bgr: np.ndarray) -> Tuple[str, float]:
     t, c = run_ocr_multi(bgr)
     t = clean_candidate_text(postprocess_name(t))
+    t = canonicalize_with_hints(t)
     return t, c
 
 
@@ -617,7 +632,7 @@ def detect_rows_and_extract8(bgr: np.ndarray) -> Tuple[Dict[str,List[str]], dict
     top = int(h * 0.12); bottom = int(h * 0.92)
     left = int(w * 0.06); right = int(w * 0.40)
     crop = bgr[top:bottom, left:right]
-    mg, mp = detect_masks(crop)
+    # masks
     def _centroids(mask: np.ndarray, min_area: int) -> List[Tuple[int,int,int]]:
         cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         out: List[Tuple[int,int,int]] = []
@@ -630,6 +645,8 @@ def detect_rows_and_extract8(bgr: np.ndarray) -> Tuple[Dict[str,List[str]], dict
             out.append((cx, cy, int(a)))
         out.sort(key=lambda x: -x[2])
         return out
+    # colores
+    mg, mp = detect_masks(crop)
     mains  = _centroids(mg, min_area=max(240, CFG.neigh_min_area_hard))
     neighs = _centroids(mp, min_area=max(180, CFG.neigh_min_area_hard // 2))
     if not mains:
@@ -651,7 +668,7 @@ def detect_rows_and_extract8(bgr: np.ndarray) -> Tuple[Dict[str,List[str]], dict
             side = angle_to_8(angle_between((mcx, mcy), best))
         owner, roi, attempt_id = _extract_owner_from_row(bgr, row_y=mcy, lines=max(1, CFG.row_owner_lines))
         if owner:
-            owner = postprocess_name(owner)
+            owner = canonicalize_with_hints(postprocess_name(owner))
         if side and owner:
             if owner not in ldr[side]:
                 ldr[side].append(owner); used_rows += 1
@@ -659,7 +676,7 @@ def detect_rows_and_extract8(bgr: np.ndarray) -> Tuple[Dict[str,List[str]], dict
     return ldr, {"rows": rows_dbg, "used_rows": used_rows}
 
 # ----------------------------------------
-# Notarial
+# Notarial (plantilla)
 # ----------------------------------------
 
 def generate_notarial_text(extracted: Dict) -> str:
@@ -676,7 +693,7 @@ def generate_notarial_text(extracted: Dict) -> str:
     return f"Linda: {sides_text}." if sides_text else "No se han podido determinar linderos suficientes para una redacción notarial fiable."
 
 # ----------------------------------------
-# Fusión + expansión de diagonales (siempre)
+# Fusión + expansión de diagonales
 # ----------------------------------------
 
 def expand_diagonals_to_cardinals(ldr: Dict[str, List[str]]) -> Dict[str, List[str]]:
@@ -694,26 +711,23 @@ def expand_diagonals_to_cardinals(ldr: Dict[str, List[str]]) -> Dict[str, List[s
                 ldr[a].append(nm)
             if nm and nm not in ldr[b]:
                 ldr[b].append(nm)
-        # limpiar diagonal tras expandir
-        ldr[diag] = []
+        ldr[diag] = []  # limpiar diagonal tras expandir
     return ldr
 
 # ----------------------------------------
-# Proceso principal
+# Proceso por PDF
 # ----------------------------------------
 
 def process_pdf(pdf_bytes: bytes) -> ExtractResult:
-    # Raster
     bgr = load_map_page_bgr(pdf_bytes, budget=float(CFG.edge_budget_ms))
 
-    # Gate OCR ligero
     sample_text, _ = run_ocr(bgr, psm=6, lang="spa+eng")
     if len(sample_text) < 12:
         raise HTTPException(status_code=400, detail="El PDF no contiene texto OCR legible o metadatos reconocibles para su análisis.")
 
     owners_detected_union: List[str] = []
 
-    # Pipeline map_based
+    # Pipeline map_based (color + MSER)
     m_green, m_pink = detect_masks(bgr)
     subs = contours_and_centroids(m_green)
     neigh = contours_and_centroids(m_pink)
@@ -733,7 +747,7 @@ def process_pdf(pdf_bytes: bytes) -> ExtractResult:
         if not neigh:
             neigh = find_text_neighbors(bgr, subj["bbox"])  # MSER fallback
         subj_c = subj["centroid"]
-        for i, nb in enumerate(neigh[:10]):
+        for nb in neigh[:10]:
             side = angle_to_8(angle_between(subj_c, nb["centroid"]))
             name, conf = ocr_name_near(bgr, nb["bbox"])
             if not name or len(name) < 4:
@@ -741,18 +755,21 @@ def process_pdf(pdf_bytes: bytes) -> ExtractResult:
                 if len(name2) > len(name):
                     name, conf = name2, conf2
             x, y, w, h = nb["bbox"]
-            line2_box = (x - int(0.2*w), y + h, int(w*1.4), int(h * 1.0))
+            line2_box = (x - int(0.25*w), y + h, int(w*1.6), int(h * 1.25))
             l2_name, _ = ocr_name_near(bgr, line2_box)
             final = maybe_concat_second_line([name, l2_name]) if name else l2_name
             final = clean_candidate_text(postprocess_name(final))
+            final = canonicalize_with_hints(final)
             if final and final not in ldr_map[side]:
                 ldr_map[side].append(final)
-                owners_detected_union.append(final)
+                if final not in owners_detected_union:
+                    owners_detected_union.append(final)
 
-    # Pipeline row_based
+    # Pipeline row_based (legacy mejorado)
     ldr_row, rows_dbg = detect_rows_and_extract8(bgr)
     for side, arr in ldr_row.items():
         for nm in arr:
+            nm = canonicalize_with_hints(nm)
             if nm and nm not in owners_detected_union:
                 owners_detected_union.append(nm)
 
@@ -762,7 +779,7 @@ def process_pdf(pdf_bytes: bytes) -> ExtractResult:
         seen = set()
         for src in (ldr_map.get(side, []), ldr_row.get(side, [])):
             for nm in src:
-                nm_pp = postprocess_name(nm)
+                nm_pp = canonicalize_with_hints(postprocess_name(nm))
                 if nm_pp and nm_pp not in seen:
                     ldr_out[side].append(nm_pp); seen.add(nm_pp)
 
@@ -777,7 +794,14 @@ def process_pdf(pdf_bytes: bytes) -> ExtractResult:
     if CFG.diag_mode:
         debug = {"method": used_method, "rows": rows_dbg, "subject_centroid": (subs[0]["centroid"] if subs else None)}
 
-    return ExtractResult(linderos=ldr_model, owners_detected=list(dict.fromkeys(owners_detected_union))[:24], notarial_text=notarial, note=None, debug=debug, files=files)
+    return ExtractResult(
+        linderos=ldr_model,
+        owners_detected=list(dict.fromkeys(owners_detected_union))[:24],
+        notarial_text=notarial,
+        note=None,
+        debug=debug,
+        files=files,
+    )
 
 # ----------------------------------------
 # API
@@ -819,5 +843,6 @@ def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
+
 
 
