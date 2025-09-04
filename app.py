@@ -19,6 +19,7 @@ Variables recomendadas (Railway → Variables):
 - DIAG_KEEP_DOMINANCE=0.55, CARD_PAIR_MIN_EACH=0.20, CARD_PAIR_MIN_COMBINED=0.50, CARD_SINGLE_MIN=0.30
 - DIAG_TO_CARDINALS=0
 - OWNER_ALLOW_DIGITS=0
+- ANTI_HEADER_KWS=TITULARIDAD|PRINCIPAL|TITULAR|SECUNDARIA|S/S|SS
 """
 from __future__ import annotations
 
@@ -80,6 +81,7 @@ class Cfg:
 
     owner_allow_digits: bool = os.getenv("OWNER_ALLOW_DIGITS", "0") == "1"
 
+    # NUEVO: lista de tokens de cabecera a eliminar de candidatos
     anti_header_kws: List[str] = field(default_factory=lambda: [
         s.strip() for s in os.getenv("ANTI_HEADER_KWS", "TITULARIDAD|PRINCIPAL|TITULAR|SECUNDARIA|S/S|SS").split("|")
         if s.strip()
@@ -159,6 +161,7 @@ def require_token(credentials: Optional[HTTPAuthorizationCredentials] = Depends(
 def strip_accents(s: str) -> str:
     return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
 
+# NUEVO: set con tokens de cabecera a filtrar
 ANTI_HEADER = set(strip_accents(s).upper() for s in CFG.anti_header_kws)
 
 LOWER_CONNECTORS = {"de","del","la","las","los","y","da","do","das","dos"}
@@ -231,6 +234,10 @@ def looks_like_address(s: str) -> bool:
 
 
 def drop_anti_header_tokens(s: str) -> str:
+    """
+    Elimina tokens típicos de cabecera de tabla (p. ej. 'Titularidad', 'Principal', 'SS', 'S/S') de un candidato.
+    Mantiene el resto del nombre.
+    """
     if not s:
         return ""
     toks = s.strip().split()
@@ -251,20 +258,13 @@ def clean_candidate_text(s: str) -> str:
     # 1) Quitar tokens de cabecera de tabla
     s = drop_anti_header_tokens(s)
 
-    # 2) Sanitizar sin regex
-    out_chars = []
-    for ch in s:
-        cat = unicodedata.category(ch)
-        if cat.startswith('L') or cat.startswith('N') or ch in " .'-":
-            out_chars.append(ch)
-        else:
-            out_chars.append(' ')
-    s = "".join(out_chars)
-    s = " ".join(s.split()).strip(" .-'")
+    # 2) Sanitizar
+    s = re.sub(r"[^0-9A-Za-zÁÉÍÓÚÜÑáéíóúüñ .'-]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip(" .-'")
     up = strip_accents(s).upper()
 
     # 3) Defensa frente a símbolos / rótulos
-    for ch in ["=","*","_","/","\","|","[","]","{","}","<",">"]:
+    for ch in ["=", "*", "_", "/", "\\", "|", "[", "]", "{", "}", "<", ">"]:
         if ch in up:
             return ""
     STOP = {
@@ -278,8 +278,8 @@ def clean_candidate_text(s: str) -> str:
     # 4) Direcciones / números
     if looks_like_address(up):
         return ""
-    if not CFG.owner_allow_digits and any(c.isdigit() for c in up):
-        if not any(tok in up for tok in ("S.L","S L","S.A","S A","SCOOP","COOP"," CB","CB ")):
+    if not CFG.owner_allow_digits and re.search(r"\d", up):
+        if not re.search(r"\b(S\.?L\.?|S\.?A\.?|SCOOP\.?|COOP\.?|CB)\b", up):
             return ""
 
     # 5) Requiere al menos 2 tokens "de nombre"
@@ -884,4 +884,5 @@ def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
+
 
