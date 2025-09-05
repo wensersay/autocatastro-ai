@@ -817,7 +817,7 @@ def _extract_owner_from_row(bgr: np.ndarray, row_y: int, lines: int = 2) -> Tupl
                                 if all_given:
                                     extra_given.extend(buf)
                     if extra_given:
-                        # Insertar nombres propios extra INMEDIATAMENTE tras los nombres de pila de L1
+                        # Variante A: insertar en L1 tal cual (tras el bloque de nombres de pila inicial)
                         base_tokens = [t for t in segs[0].split() if t]
                         i = 0
                         while i < len(base_tokens) and strip_accents(base_tokens[i]).upper() in GIVEN_NAMES:
@@ -829,6 +829,19 @@ def _extract_owner_from_row(bgr: np.ndarray, row_y: int, lines: int = 2) -> Tupl
                         extra_clean = [t for t in extra_given if strip_accents(t).upper() not in pref_set]
                         merged = prefix + extra_clean + rest
                         variants.append(" ".join(merged))
+
+                        # Variante B: reordenar L1 primero (apellidos→final) y luego insertar tras los nombres de pila
+                        l1_reord = reorder_surname_first(segs[0])
+                        base_tokens2 = [t for t in l1_reord.split() if t]
+                        i2 = 0
+                        while i2 < len(base_tokens2) and strip_accents(base_tokens2[i2]).upper() in GIVEN_NAMES:
+                            i2 += 1
+                        prefix2 = base_tokens2[:i2]
+                        rest2 = base_tokens2[i2:]
+                        pref_set2 = {strip_accents(t).upper() for t in prefix2}
+                        extra_clean2 = [t for t in extra_given if strip_accents(t).upper() not in pref_set2]
+                        merged2 = prefix2 + extra_clean2 + rest2
+                        variants.append(" ".join(merged2))
 
                 # Puntuar por nº tokens útiles (máx) y longitud
                 def _score_name(s: str) -> Tuple[int,int]:
