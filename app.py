@@ -230,6 +230,39 @@ def propercase_spanish(s: str) -> str:
     return " ".join(out)
 
 
+def strip_honorifics_and_initials(s: str) -> str:
+    """Quita tratamientos (Don/Doña/Sr./Sra./Dr./Dra./Ilmo./Excmo.),
+    iniciales sueltas ("J.", "J") y ruido OCR inicial ("A", "AA").
+    Sin expresiones regulares para evitar escapes en despliegue.
+    """
+    if not s:
+        return ""
+    t = s.strip()
+
+    # 1) Ruido OCR típico al inicio
+    lead_noise = {"A", "AA", "A.A", "A."}
+    tokens = [tok for tok in t.split() if tok]
+    def _norm(tok: str) -> str:
+        return strip_accents(tok).upper().replace(".", "")
+    while tokens and _norm(tokens[0]) in lead_noise:
+        tokens.pop(0)
+
+    # 2) Tratamientos / honoríficos al inicio
+    HON = {"D", "DON", "DOÑA", "DÑA", "SR", "SRA", "SRES", "SRAS", "DR", "DRA", "EXCMO", "EXCMA", "ILMO", "ILMA"}
+    while tokens and _norm(tokens[0]) in HON:
+        tokens.pop(0)
+
+    # 3) Quitar iniciales sueltas (con o sin punto)
+    cleaned: List[str] = []
+    for tok in tokens:
+        u = _norm(tok)
+        if len(u) == 1:
+            continue
+        cleaned.append(tok)
+
+    t = " ".join(cleaned).strip(" -.,;:")
+    return t
+
 def reorder_surname_first(s: str) -> str:
     """Si el/los *últimos* tokens son nombre(s) de pila (1–2), muévelos delante.
     Ej.: "Pérez Taboada Julio" → "Julio Pérez Taboada";
