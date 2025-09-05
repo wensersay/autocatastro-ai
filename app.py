@@ -300,6 +300,9 @@ def clean_candidate_text(s: str) -> str:
     for ch in SYMBOLS_BLOCK:
         if ch in up:
             return ""
+    for ch in SYMBOLS_BLOCK:
+        if ch in up:
+            return ""
     STOP = {
         "DATOS","ESCALA","LEYENDA","MAPA","COORDENADAS","COORD","REFERENCIA","CATASTRAL",
         "PARCELA","POLIGONO","POLÍGONO","HOJA","AHORA","NORTE","SUR","ESTE","OESTE",
@@ -1088,6 +1091,7 @@ def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
+
 
 
 
