@@ -82,6 +82,9 @@ class Cfg:
 
     angle_snap_deg: float = float(os.getenv("ANGLE_SNAP_DEG", "18"))
 
+    # Cobertura mínima en cardinal para hacer snap desde diagonal por ángulo
+    card_snap_min_cov: float = float(os.getenv("CARD_SNAP_MIN_COV", "0.15"))
+
     anti_header_kws: List[str] = field(default_factory=lambda: [
         s.strip() for s in os.getenv("ANTI_HEADER_KWS", "TITULARIDAD|PRINCIPAL|TITULAR|SECUNDARIA|S/S|SS").split("|")
         if s.strip()
@@ -488,7 +491,7 @@ def _ang_dist(a: float, b: float) -> float:
 
 def snap_diagonal_to_cardinal_by_angle(diag: str, angle: float, cov: Dict[str, float]) -> Optional[str]:
     """Si un vecino cae angularmente muy cerca de un cardinal, preferir el cardinal.
-    Se requiere además algo de cobertura en ese cardinal para robustez.
+    Requiere proximidad angular (<= ANGLE_SNAP_DEG) y una cobertura mínima en el cardinal.
     """
     if diag not in PAIRS:
         return None
@@ -496,10 +499,12 @@ def snap_diagonal_to_cardinal_by_angle(diag: str, angle: float, cov: Dict[str, f
     da = _ang_dist(angle, CARDINAL_CENTERS[a])
     db = _ang_dist(angle, CARDINAL_CENTERS[b])
     thr = CFG.angle_snap_deg
+    # cobertura mínima configurable
+    min_cov = CFG.card_snap_min_cov
     cand = None
-    if da <= db and da <= thr and cov.get(a, 0.0) >= max(0.22, 0.8 * CFG.card_single_min):
+    if da <= db and da <= thr and cov.get(a, 0.0) >= min_cov:
         cand = a
-    elif db < da and db <= thr and cov.get(b, 0.0) >= max(0.22, 0.8 * CFG.card_single_min):
+    elif db < da and db <= thr and cov.get(b, 0.0) >= min_cov:
         cand = b
     return cand
 
@@ -1048,5 +1053,6 @@ def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
+
 
 
