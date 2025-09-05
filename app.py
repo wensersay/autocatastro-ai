@@ -763,7 +763,7 @@ def _find_header_and_owner_band(bgr: np.ndarray, row_y: int, x_text0: int, x_tex
     return x0, x1, y0, y1
 
 
-def _extract_owner_from_row(bgr: np.ndarray, row_y: int, lines: int = 2) -> Tuple[str, Tuple[int,int,int,int], int]:(bgr: np.ndarray, row_y: int, lines: int = 2) -> Tuple[str, Tuple[int,int,int,int], int]:
+def _extract_owner_from_row(bgr: np.ndarray, row_y: int, lines: int = 2) -> Tuple[str, Tuple[int,int,int,int], int]:
     h, w = bgr.shape[:2]
     x_text0 = int(w * 0.30); x_text1 = int(w * 0.96)
     attempts = []
