@@ -264,7 +264,7 @@ def clean_candidate_text(s: str) -> str:
     up = strip_accents(s).upper()
 
     # 3) Defensa frente a símbolos / rótulos
-    for ch in ["=", "*", "_", "/", "\\", "|", "[", "]", "{", "}", "<", ">"]:
+    for ch in ["=", "*", "_", "/", "\", "|", "[", "]", "{", "}", "<", ">"]:
         if ch in up:
             return ""
     STOP = {
@@ -876,36 +876,40 @@ def process_pdf(pdf_bytes: bytes) -> ExtractResult:
                 ldr_out[side].append(nm_pp)
                 seen_side.append(nm_pp)
 
-    # 3.c) Añadir color mapeando a canónicos de row si son la misma persona
+    # 3.c) Añadir color mapeando a canónicos de row si son la misma persona (respeta el lado del row)
     for side in SIDE_ORDER:
         for nm in (ldr_color.get(side, []) or []):
             nm_pp = clean_candidate_text(postprocess_name(nm))
             if not nm_pp:
                 continue
+            # mapear a canónico de row si hace match
             mapped = None
             for r in row_canon:
                 if same_person(nm_pp, r):
                     mapped = r
                     break
             candidate = mapped or nm_pp
+            # si el candidato ya aparece por row en algún lado, **no** lo dupliques en otro lado: respeta el/los lados del row
+            row_sides_for_candidate = [s for s in SIDE_ORDER if any(same_person(candidate, ex) for ex in ldr_out[s])]
+            if row_sides_for_candidate:
+                continue
+            # si no aparece aún por row, añadir en el lado propuesto por color evitando duplicados por similitud
             if any(same_person(candidate, ex) for ex in ldr_out[side]):
                 continue
             ldr_out[side].append(candidate)
 
-    # 3.d) Limpiar diagonales por titular: si aparece en sus cardinales, quitar de diagonal
+    # 3.d) Limpiar diagonales por titular: solo si el **mismo titular** aparece en **ambos** cardinales
     for diag, (a, b) in PAIRS.items():
         if ldr_out[diag]:
             keep = []
             for nm in ldr_out[diag]:
-                if any(same_person(nm, ex) for ex in (ldr_out[a] + ldr_out[b])):
+                in_a = any(same_person(nm, ex) for ex in ldr_out[a])
+                in_b = any(same_person(nm, ex) for ex in ldr_out[b])
+                # eliminar de la diagonal únicamente si está en A **y** en B
+                if in_a and in_b:
                     continue
                 keep.append(nm)
             ldr_out[diag] = keep
-
-    # 4) Vaciar diagonales si hay sus dos cardinales presentes (preferencia notarial)
-    for diag, (a, b) in {"noreste": ("norte","este"), "sureste": ("sur","este"), "suroeste": ("sur","oeste"), "noroeste": ("norte","oeste")}.items():
-        if ldr_out[a] and ldr_out[b]:
-            ldr_out[diag] = []
 
     # 5) Notarial agrupado
     notarial = generate_notarial_text_grouped(ldr_out)
@@ -968,8 +972,6 @@ def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
-
-
 
 
 
