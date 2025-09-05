@@ -12,13 +12,19 @@ Correcciones sobre 0.9.1 a raíz del caso «74 Marouzas Os Luis 14»:
 
 Variables recomendadas (Railway → Variables):
 - FAST_MODE=1, PDF_DPI=320, DPI_FAST=220, EDGE_BUDGET_MS=25000
-- NEIGH_MIN_AREA_HARD=300, NEIGH_MAX_DIST_RATIO=2.2
-- ROW_OWNER_LINES=2, SECOND_LINE_FORCE=1, SECOND_LINE_MAXCHARS=40, SECOND_LINE_MAXTOKENS=8
+- NEIGH_MIN_AREA_HARD=300, NEIGH_MAX_DIST_RATIO=1.8
+- ROW_OWNER_LINES=2, SECOND_LINE_FORCE=1, SECOND_LINE_MAXCHARS=64, SECOND_LINE_MAXTOKENS=14
+- SECOND_LINE_SCAN_EXTRA_PCT=0.03, SECOND_LINE_SCAN_MAX_PCT=0.06
+- L2_ALIGN_TOL_PCT=0.12, L2_MAX_GAP_FACTOR=1.8, L2_MAX_LINES=3
 - PROPERCASE=1
 - SECTOR_ASSIGN_MODE=smart
-- DIAG_KEEP_DOMINANCE=0.55, CARD_PAIR_MIN_EACH=0.20, CARD_PAIR_MIN_COMBINED=0.50, CARD_SINGLE_MIN=0.30
+- DIAG_KEEP_DOMINANCE=0.60, CARD_PAIR_MIN_EACH=0.24, CARD_PAIR_MIN_COMBINED=0.50, CARD_SINGLE_MIN=0.28
 - DIAG_TO_CARDINALS=0
-- OWNER_ALLOW_DIGITS=0
+- OWNER_ALLOW_DIGITS=1
+- ROW_ANGLE_SNAP_DEG=30, ROW_CARD_DOM_FACTOR=1.07
+- ANGLE_SNAP_DEG=24, CARD_SNAP_MIN_COV=0.12
+- ANTI_HEADER_KWS="TITULARIDAD|PRINCIPAL|TITULAR|SECUNDARIA|S/S|SS"
+- GIVEN_NAMES_EXTRA=""
 """
 from __future__ import annotations
 
@@ -232,137 +238,6 @@ def reorder_surname_first(s: str) -> str:
     toks = s.split()
     if len(toks) < 2:
         return s
-
-    tail: list[str] = []
-    i = len(toks) - 1
-    # Tomamos hasta 2 nombres al final
-    for _ in range(2):
-        if i < 0:
-            break
-        up = strip_accents(toks[i]).upper()
-        if up in GIVEN_NAMES:
-            tail.append(toks[i])
-            i -= 1
-            continue
-        break
-
-    if tail:
-        tail = list(reversed(tail))
-        rest = toks[: i + 1]
-        return " ".join(tail + rest)
-    return s
-
-# --- Normalizador de orden en nombres compuestos comunes (pares) ---
-_COMPOSITE_SWAP_PAIRS = {
-    ("PABLO","JUAN"),       # → Juan Pablo
-    ("LUISA","MARIA"),     # → María Luisa
-    ("LUIS","JOSE"),       # → José Luis
-    ("ANTONIO","JOSE"),    # → José Antonio
-    ("MANUEL","JOSE"),     # → José Manuel
-}
-
-def normalize_given_pair_order(s: str) -> str:
-    toks = s.split()
-    if len(toks) >= 2:
-        a = strip_accents(toks[0]).upper()
-        b = strip_accents(toks[1]).upper()
-        if (a, b) in _COMPOSITE_SWAP_PAIRS:
-            toks[0], toks[1] = toks[1], toks[0]
-            return " ".join(toks)
-    return s
-
-HONORIFICS = {
-    "D","D.","Dª","D.ª","DÑA","DOÑA","DON","SR","SR.","SRA","SRA.","SRES.",
-    "EXCMO.","EXCMA.","ILMO.","ILMA.",
-}
-
-def strip_honorifics_and_initials(s: str) -> str:
-    """Elimina tratamientos (D., Don, Doña, Sr., …) y **iniciales sueltas** al inicio,
-    p.ej. "A"/"A." que a veces aparece por OCR. Conserva conectores como "y".
-    """
-    toks = s.split()
-    while toks:
-        if not toks:
-            break
-        t0 = toks[0]
-        up0 = strip_accents(t0).upper()
-        # Inicial suelta de 1-2 chars (no "y") o tratamiento
-        if (len(t0) <= 2 and up0 not in {"Y"}) or (up0 in HONORIFICS):
-            # Quitar también variantes con punto (p. ej. "A.")
-            if up0 in HONORIFICS or re.match(r"^[A-Z]\.?$", t0):
-                toks = toks[1:]
-                continue
-        break
-    return " ".join(toks)
-
-    tail: list[str] = []
-    i = len(toks) - 1
-    # Tomamos hasta 2 nombres al final
-    for _ in range(2):
-        if i < 0:
-            break
-        up = strip_accents(toks[i]).upper()
-        if up in GIVEN_NAMES:
-            tail.append(toks[i])
-            i -= 1
-            continue
-        break
-
-    if tail:
-        tail = list(reversed(tail))
-        rest = toks[: i + 1]
-        return " ".join(tail + rest)
-    return s
-
-HONORIFICS = {
-    "D","D.","Dª","D.ª","DÑA","DOÑA","DON","SR","SR.","SRA","SRA.","SRES.",
-    "EXCMO.","EXCMA.","ILMO.","ILMA.",
-}
-
-def strip_honorifics_and_initials(s: str) -> str:
-    """Elimina tratamientos (D., Don, Doña, Sr., …) y **iniciales sueltas** al inicio,
-    p.ej. "A"/"A." que a veces aparece por OCR. Conserva conectores como "y".
-    """
-    toks = s.split()
-    while toks:
-        if not toks:
-            break
-        t0 = toks[0]
-        up0 = strip_accents(t0).upper()
-        # Inicial suelta de 1-2 chars (no "y") o tratamiento
-        if (len(t0) <= 2 and up0 not in {"Y"}) or (up0 in HONORIFICS):
-            # Quitar también variantes con punto (p. ej. "A.")
-            if up0 in HONORIFICS or re.match(r"^[A-Z]\.?$", t0):
-                toks = toks[1:]
-                continue
-        break
-    return " ".join(toks)
-    toks = [t for t in re.split(r"\s+", s.strip()) if t]
-    if len(toks) < 2:
-        return s
-
-    norm = [strip_accents(t).upper() for t in toks]
-    GIVEN = {
-        "JOSE","JOSÉ","JUAN","PABLO","LUIS","LUISA","MARIA","MARÍA",
-        "SERGIO","ELENA","ANTONIO","MANUEL","CARLOS","ANA","LAURA","MARTA"
-    }
-
-    tail = 0
-    i = len(toks) - 1
-    while i >= 0 and tail < 2 and norm[i] in GIVEN:
-        tail += 1
-        i -= 1
-
-    if tail == 0:
-        return s
-
-    names_tail = toks[-tail:]
-    surnames   = toks[:-tail]
-
-    out = names_tail + surnames
-    pretty = propercase_spanish(" ".join(out))
-    return pretty
-
 
 def postprocess_name(text: str) -> str:
     s = (text or "").strip()
@@ -1439,6 +1314,7 @@ def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
+
 
 
 
