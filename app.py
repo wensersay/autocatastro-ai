@@ -80,10 +80,10 @@ class Cfg:
 
     owner_allow_digits: bool = os.getenv("OWNER_ALLOW_DIGITS", "0") == "1"
 
-    angle_snap_deg: float = float(os.getenv("ANGLE_SNAP_DEG", "18"))
+    angle_snap_deg: float = float(os.getenv("ANGLE_SNAP_DEG", "24"))
 
     # Cobertura mínima en cardinal para hacer snap desde diagonal por ángulo
-    card_snap_min_cov: float = float(os.getenv("CARD_SNAP_MIN_COV", "0.15"))
+    card_snap_min_cov: float = float(os.getenv("CARD_SNAP_MIN_COV", "0.12"))
 
     anti_header_kws: List[str] = field(default_factory=lambda: [
         s.strip() for s in os.getenv("ANTI_HEADER_KWS", "TITULARIDAD|PRINCIPAL|TITULAR|SECUNDARIA|S/S|SS").split("|")
@@ -697,7 +697,9 @@ def _find_header_and_owner_band(bgr: np.ndarray, row_y: int, x_text0: int, x_tex
     band = bgr[y0s:y1s, x_text0:x_text1]
     if band.size == 0:
         lh = int(h * (0.035 if lines == 1 else 0.06))
-        y0 = max(0, row_y - int(h*0.012)); y1 = min(h, y0 + lh)
+    y0 = max(0, row_y - int(h*0.012)); y1 = min(h, y0 + lh)
+    if CFG.second_line_force:
+        y1 = min(h, y1 + int(h * (0.015 if lines == 1 else 0.02)))
         return x_text0, int(x_text0 + 0.58*(x_text1-x_text0)), y0, y1
     gray = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
     bw, bwi = _binarize(gray)
@@ -714,6 +716,10 @@ def _find_header_and_owner_band(bgr: np.ndarray, row_y: int, x_text0: int, x_tex
             y0 = y0s + header_bottom + 6
             lh = int(h * (0.035 if lines == 1 else 0.06))
             y1 = min(h, y0 + lh)
+            # ampliar banda vertical si queremos forzar capturar segunda línea
+            if CFG.second_line_force:
+                extra = int(h * (0.015 if lines == 1 else 0.02))
+                y1 = min(h, y1 + extra)
             if x_nif is not None:
                 x0 = x_text0; x1 = min(x_text1, x_text0 + x_nif - 8)
             else:
@@ -936,7 +942,7 @@ def process_pdf(pdf_bytes: bytes) -> ExtractResult:
                     ldr_color[side].append(name)
             if name not in owners_detected_union:
                 owners_detected_union.append(name)
-            debug_rows.append({"neighbor_bbox": list(nb["bbox"]), "centroid": list(nb["centroid"]), "coverage": coverage, "assigned": sides, "owner": name})
+            debug_rows.append({"neighbor_bbox": list(nb["bbox"]), "centroid": list(nb["centroid"]), "angle": angle_val, "coverage": coverage, "assigned": sides, "owner": name})
 
     # 3) Fusión (prioridad a row-based)
     # 3.a) Canonizar lista de titulares encontrados por tabla (row)
