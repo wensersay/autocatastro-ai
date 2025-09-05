@@ -881,33 +881,25 @@ def _extract_owner_from_row(bgr: np.ndarray, row_y: int, lines: int = 2) -> Tupl
                             gg = cv2.resize(gg, None, fx=1.35, fy=1.35, interpolation=cv2.INTER_CUBIC)
                             gg = _enhance_gray(gg)
                             # Usar líneas para capturar 'Pablo' incluso si aparece solo en una línea
-                            lines_below = ocr_image_to_data_lines(cv2.cvtColor(gg, cv2.COLOR_GRAY2BGR))
-                            taken: list[str] = []
-                            for (tline, _lbbox) in lines_below[:3]:
-                            cand = postprocess_name(tline)
-                            toks = [t for t in cand.split() if t]
-                            buf: list[str] = []
-                            # Preferencia: 1–2 nombres propios conocidos
-                            for t in toks[:2]:
-                                up = strip_accents(t).upper()
-                                if up in GIVEN_NAMES:
-                                    buf.append(t)
-                                else:
-                                    break
-                            if 1 <= len(buf) <= 2:
-                                taken = buf
-                                break
-                            # Fallback: primer token alfabético Capitalizado que no sea conector (DE/DEL/…)
-                            if not taken and toks:
-                                for t in toks[:2]:
-                                    raw = t.strip(".,;:()[]{}")
-                                    up = strip_accents(raw).upper()
-                                    if re.match(r"^[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]{2,14}$", raw) and up not in NAME_CONNECTORS:
-                                        taken = [propercase_spanish(raw)]
+                            # Usar extractor multilinea robusto directamente sobre ROI a color
+                            name_below_full = extract_name_multiline_from_roi(roi_below)
+                            if name_below_full:
+                                toks = [t for t in name_below_full.split() if t]
+                                extra_taken: list[str] = []
+                                for t in toks:
+                                    up = strip_accents(t).upper()
+                                    if up in NAME_CONNECTORS:
+                                        continue
+                                    # Aceptar 1–2 nombres de pila probables
+                                    if up in GIVEN_NAMES or re.match(r"^[A-ZÁÉÍÓÚÜÑ][a-záéíóúüñ]{1,}$", t):
+                                        extra_taken.append(t)
+                                        if len(extra_taken) >= 2:
+                                            break
+                                    else:
                                         break
-                            if taken:
-                                extra_given.extend(taken)
-                                break
+                                if extra_taken:
+                                    extra_given.extend(extra_taken)
+                                    break
                     for j in (1, 2):
                         if j < len(segs) and segs[j]:
                             toksj = [t for t in segs[j].split() if t]
@@ -1275,6 +1267,7 @@ def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
+
 
 
 
