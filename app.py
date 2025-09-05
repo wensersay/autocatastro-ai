@@ -296,7 +296,8 @@ def clean_candidate_text(s: str) -> str:
     up = strip_accents(s).upper()
 
     # 3) Defensa frente a símbolos / rótulos
-    SYMBOLS_BLOCK = ["=", "*", "_", "/", "\\", "|", "[", "]", "{", "}", "<", ">"]
+    SYMBOLS_BLOCK = ["=", "*", "_", "/", "\", "|", "[", "]", "{", "}", "<", ">"]
+    SYMBOLS_BLOCK = ["=", "*", "_", "/", "\", "|", "[", "]", "{", "}", "<", ">"]
     for ch in SYMBOLS_BLOCK:
         if ch in up:
             return ""
@@ -690,42 +691,71 @@ def _pick_owner_from_text(txt: str) -> str:
 
 
 def _find_header_and_owner_band(bgr: np.ndarray, row_y: int, x_text0: int, x_text1: int, lines: int = 2) -> Tuple[int,int,int,int]:
+    """Devuelve (x0, x1, y0, y1) para la banda del NOMBRE del titular.
+    Se busca 'APELLIDOS' y se coloca y0 justo debajo. Alto: ~3.5%/6% de la página.
+    Siempre inicializa 'lh' para evitar UnboundLocalError.
+    """
     h, w = bgr.shape[:2]
+
+    # Altura base de la banda y extra si forzamos 2ª línea
+    lh = int(h * (0.035 if lines == 1 else 0.06))
+    extra_lh = int(h * (0.015 if lines == 1 else 0.02)) if CFG.second_line_force else 0
+
     pad_y = int(h * 0.06)
     y0s = max(0, row_y - pad_y)
     y1s = min(h, row_y + pad_y)
+
     band = bgr[y0s:y1s, x_text0:x_text1]
     if band.size == 0:
-        lh = int(h * (0.035 if lines == 1 else 0.06))
-    y0 = max(0, row_y - int(h*0.012)); y1 = min(h, y0 + lh)
-    if CFG.second_line_force:
-        y1 = min(h, y1 + int(h * (0.015 if lines == 1 else 0.02)))
-        return x_text0, int(x_text0 + 0.58*(x_text1-x_text0)), y0, y1
+        # Fallback conservador
+        y0 = max(0, row_y - int(h * 0.012))
+        y1 = min(h, y0 + lh + extra_lh)
+        x0 = x_text0
+        x1 = int(x_text0 + 0.58 * (x_text1 - x_text0))
+        return x0, x1, y0, y1
+
     gray = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
     bw, bwi = _binarize(gray)
+
     for im in (bw, bwi):
         data = pytesseract.image_to_data(im, output_type=pytesseract.Output.DICT, config="--psm 6 --oem 3")
-        words = data.get("text", []); xs = data.get("left", []); ys = data.get("top", []); ws = data.get("width", []); hs = data.get("height", [])
-        x_nif = None; header_bottom = None
+        words = data.get("text", [])
+        xs = data.get("left", [])
+        ys = data.get("top", [])
+        ws = data.get("width", [])
+        hs = data.get("height", [])
+
+        x_nif = None
+        header_bottom = None
+
         for t, lx, ty, ww, hh in zip(words, xs, ys, ws, hs):
-            if not t: continue
+            if not t:
+                continue
             T = t.upper()
-            if "APELLIDOS" in T: header_bottom = max(header_bottom or 0, ty + hh)
-            if T == "NIF": x_nif = lx; header_bottom = max(header_bottom or 0, ty + hh)
+            if "APELLIDOS" in T:
+                header_bottom = max(header_bottom or 0, ty + hh)
+            if T == "NIF":
+                x_nif = lx
+                header_bottom = max(header_bottom or 0, ty + hh)
+
         if header_bottom is not None:
             y0 = y0s + header_bottom + 6
-            lh = int(h * (0.035 if lines == 1 else 0.06))
-            y1 = min(h, y0 + lh)
-            # ampliar banda vertical si queremos forzar capturar segunda línea
-            if CFG.second_line_force:
-                extra = int(h * (0.015 if lines == 1 else 0.02))
-                y1 = min(h, y1 + extra)
+            y1 = min(h, y0 + lh + extra_lh)
             if x_nif is not None:
-                x0 = x_text0; x1 = min(x_text1, x_text0 + x_nif - 8)
+                x0 = x_text0
+                x1 = min(x_text1, x_text0 + x_nif - 8)
             else:
-                x0 = x_text0; x1 = int(x_text0 + 0.58*(x_text1-x_text0))
+                x0 = x_text0
+                x1 = int(x_text0 + 0.58 * (x_text1 - x_text0))
             if x1 - x0 > (x_text1 - x_text0) * 0.22:
                 return x0, x1, y0, y1
+
+    # Fallback si no se detecta cabecera 'APELLIDOS'/'NIF'
+    y0 = max(0, row_y - int(h * 0.012))
+    y1 = min(h, y0 + lh + extra_lh)
+    x0 = x_text0
+    x1 = int(x_text0 + 0.58 * (x_text1 - x_text0))
+    return x0, x1, y0, y1
     lh = int(h * (0.035 if lines == 1 else 0.06))
     y0 = max(0, row_y - int(h*0.012)); y1 = min(h, y0 + lh)
     x0 = x_text0; x1 = int(x_text0 + 0.58*(x_text1-x_text0))
