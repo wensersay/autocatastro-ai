@@ -64,7 +64,7 @@ class Cfg:
     second_line_maxtokens: int = int(os.getenv("SECOND_LINE_MAXTOKENS", "8"))
 
     neigh_min_area_hard: int = int(os.getenv("NEIGH_MIN_AREA_HARD", "600"))
-    neigh_max_dist_ratio: float = float(os.getenv("NEIGH_MAX_DIST_RATIO", "2.2"))
+    neigh_max_dist_ratio: float = float(os.getenv("NEIGH_MAX_DIST_RATIO", "1.8"))
 
     row_owner_lines: int = int(os.getenv("ROW_OWNER_LINES", "2"))
 
@@ -165,7 +165,7 @@ LOWER_CONNECTORS = {"de","del","la","las","los","y","da","do","das","dos"}
 ACCENT_MAP = {
     "JOSE": "José", "RODRIGUEZ": "Rodríguez", "ALVAREZ": "Álvarez", "LOPEZ": "López",
     "FERNANDEZ": "Fernández", "VAZQUEZ": "Vázquez", "MARTIN": "Martín", "MARTINEZ": "Martínez",
-    "PEREZ": "Pérez", "GOMEZ": "Gómez", "GARCIA": "García", "NUNEZ": "Núñez",
+    "PEREZ": "Pérez", "GOMEZ": "Gómez", "GARCIA": "García", "NUNEZ": "Núñez", "MARIA": "María"
 }
 GIVEN_NAMES = {"JOSE","JOSÉ","LUIS","MARIA","MARÍA","ANTONIO","MANUEL","ANA","JUAN","CARLOS","PABLO","ROGELIO","FRANCISCO","MARTA","ELENA","LAURA","JOSÉ","LUÍS"}
 UPPER_NAME_RE = re.compile(r"^[A-ZÁÉÍÓÚÜÑ][A-ZÁÉÍÓÚÜÑ\s\.'\-]+$", re.UNICODE)
@@ -264,7 +264,7 @@ def clean_candidate_text(s: str) -> str:
     up = strip_accents(s).upper()
 
     # 3) Defensa frente a símbolos / rótulos
-    for ch in ["=", "*", "_", "/", "\", "|", "[", "]", "{", "}", "<", ">"]:
+    for ch in ["=", "*", "_", "/", "\\", "|", "[", "]", "{", "}", "<", ">"]:
         if ch in up:
             return ""
     STOP = {
@@ -516,16 +516,6 @@ def decide_sides_smart(cov: Dict[str, float]) -> List[str]:
                 return [best_card]
 
     # 6) En última instancia, devolver el mejor lado bruto
-    return [best_side]
-card_pairs = [("norte","este"),("este","sur"),("sur","oeste"),("oeste","norte")]
-    best_pair: Optional[Tuple[str,str]] = None
-    best_sum = 0.0
-    for a,b in card_pairs:
-        s = cov[a] + cov[b]
-        if cov[a] >= CFG.card_single_min and cov[b] >= CFG.card_single_min and s > best_sum:
-            best_sum = s; best_pair = (a,b)
-    if best_pair:
-        return list(best_pair)
     return [best_side]
 
 # ----------------------------------------
@@ -914,7 +904,6 @@ for diag, (a, b) in PAIRS.items():
         ldr_out[diag] = keep
 
 # 4) Vaciar diagonales si hay sus dos cardinales presentes (preferencia notarial)
- si hay sus dos cardinales presentes (preferencia notarial)
     for diag, (a, b) in {"noreste": ("norte","este"), "sureste": ("sur","este"), "suroeste": ("sur","oeste"), "noroeste": ("norte","oeste")}.items():
         if ldr_out[a] and ldr_out[b]:
             ldr_out[diag] = []
