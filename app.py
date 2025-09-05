@@ -252,6 +252,68 @@ def reorder_surname_first(s: str) -> str:
         return " ".join(tail + rest)
     return s
 
+# --- Normalizador de orden en nombres compuestos comunes (pares) ---
+_COMPOSITE_SWAP_PAIRS = {
+    ("PABLO","JUAN"),       # → Juan Pablo
+    ("LUISA","MARIA"),     # → María Luisa
+    ("LUIS","JOSE"),       # → José Luis
+    ("ANTONIO","JOSE"),    # → José Antonio
+    ("MANUEL","JOSE"),     # → José Manuel
+}
+
+def normalize_given_pair_order(s: str) -> str:
+    toks = s.split()
+    if len(toks) >= 2:
+        a = strip_accents(toks[0]).upper()
+        b = strip_accents(toks[1]).upper()
+        if (a, b) in _COMPOSITE_SWAP_PAIRS:
+            toks[0], toks[1] = toks[1], toks[0]
+            return " ".join(toks)
+    return s
+
+HONORIFICS = {
+    "D","D.","Dª","D.ª","DÑA","DOÑA","DON","SR","SR.","SRA","SRA.","SRES.",
+    "EXCMO.","EXCMA.","ILMO.","ILMA.",
+}
+
+def strip_honorifics_and_initials(s: str) -> str:
+    """Elimina tratamientos (D., Don, Doña, Sr., …) y **iniciales sueltas** al inicio,
+    p.ej. "A"/"A." que a veces aparece por OCR. Conserva conectores como "y".
+    """
+    toks = s.split()
+    while toks:
+        if not toks:
+            break
+        t0 = toks[0]
+        up0 = strip_accents(t0).upper()
+        # Inicial suelta de 1-2 chars (no "y") o tratamiento
+        if (len(t0) <= 2 and up0 not in {"Y"}) or (up0 in HONORIFICS):
+            # Quitar también variantes con punto (p. ej. "A.")
+            if up0 in HONORIFICS or re.match(r"^[A-Z]\.?$", t0):
+                toks = toks[1:]
+                continue
+        break
+    return " ".join(toks)
+
+    tail: list[str] = []
+    i = len(toks) - 1
+    # Tomamos hasta 2 nombres al final
+    for _ in range(2):
+        if i < 0:
+            break
+        up = strip_accents(toks[i]).upper()
+        if up in GIVEN_NAMES:
+            tail.append(toks[i])
+            i -= 1
+            continue
+        break
+
+    if tail:
+        tail = list(reversed(tail))
+        rest = toks[: i + 1]
+        return " ".join(tail + rest)
+    return s
+
 HONORIFICS = {
     "D","D.","Dª","D.ª","DÑA","DOÑA","DON","SR","SR.","SRA","SRA.","SRES.",
     "EXCMO.","EXCMA.","ILMO.","ILMA.",
@@ -303,18 +365,20 @@ def strip_honorifics_and_initials(s: str) -> str:
 
 
 def postprocess_name(text: str) -> str:
-    s = re.sub(r"\s+", " ", (text or "")).strip()
+    s = (text or "").strip()
     if not s:
         return ""
     if "," in s:
         parts = [p.strip() for p in s.split(",")]
         if len(parts) == 2 and len(parts[0]) >= 3 and len(parts[1]) >= 2:
             s = f"{parts[1]} {parts[0]}"
-    s = s.replace("  ", " ")
-    s = re.sub(r"\b(TITULAR EN INVESTIGACION|TITULAR EN INVESTIGACIÓN)\b", "Titular en investigación", s, flags=re.I)
+    # Normaliza espacios sin usar regex con escapes
+    s = " ".join(s.split())
+
     s = strip_honorifics_and_initials(s)
     s = propercase_spanish(s)
     s = reorder_surname_first(s)
+    s = normalize_given_pair_order(s)
     return s
 
 
