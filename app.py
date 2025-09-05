@@ -1,5 +1,5 @@
 """
-app.py — autoCata v0.9.2 (row+color fusion, anti-dirección)
+app.py — autoCata v0.9.3 (row+color fusion, anti-dirección)
 
 Correcciones sobre 0.9.1 a raíz del caso «74 Marouzas Os Luis 14»:
 - **Fuente de verdad = tabla de “Apellidos y nombre / Razón social”** (row-based).
@@ -41,7 +41,7 @@ from pdf2image import convert_from_bytes
 from pydantic import BaseModel, Field
 from PIL import Image
 
-__version__ = "0.9.2"
+__version__ = "0.9.3"
 
 # ----------------------------------------
 # Configuración
@@ -60,8 +60,8 @@ class Cfg:
     name_hints_file: Optional[str] = os.getenv("NAME_HINTS_FILE")
 
     second_line_force: bool = os.getenv("SECOND_LINE_FORCE", "1") == "1"
-    second_line_maxchars: int = int(os.getenv("SECOND_LINE_MAXCHARS", "48"))
-    second_line_maxtokens: int = int(os.getenv("SECOND_LINE_MAXTOKENS", "10"))
+    second_line_maxchars: int = int(os.getenv("SECOND_LINE_MAXCHARS", "64"))
+    second_line_maxtokens: int = int(os.getenv("SECOND_LINE_MAXTOKENS", "14"))
 
     neigh_min_area_hard: int = int(os.getenv("NEIGH_MIN_AREA_HARD", "600"))
     neigh_max_dist_ratio: float = float(os.getenv("NEIGH_MAX_DIST_RATIO", "1.8"))
@@ -698,14 +698,13 @@ def _pick_owner_from_text(txt: str) -> str:
 
 def _find_header_and_owner_band(bgr: np.ndarray, row_y: int, x_text0: int, x_text1: int, lines: int = 2) -> Tuple[int,int,int,int]:
     """Devuelve (x0, x1, y0, y1) para la banda del NOMBRE del titular.
-    Se busca 'APELLIDOS' y se coloca y0 justo debajo. Alto: ~3.5%/6% de la página.
-    Siempre inicializa 'lh' para evitar UnboundLocalError.
+    Se busca 'APELLIDOS' y se coloca y0 justo debajo. Alto ampliado para capturar L2 (mini‑tweak ROI).
     """
     h, w = bgr.shape[:2]
 
-    # Altura base de la banda y extra si forzamos 2ª línea
-    lh = int(h * (0.035 if lines == 1 else 0.06))
-    extra_lh = int(h * (0.015 if lines == 1 else 0.02)) if CFG.second_line_force else 0
+    # Altura base de la banda y extra si forzamos 2ª línea (mini‑tweak ROI)
+    lh = int(h * (0.075 if lines == 1 else 0.08))
+    extra_lh = int(h * (0.020 if lines == 1 else 0.028)) if CFG.second_line_force else 0
 
     pad_y = int(h * 0.06)
     y0s = max(0, row_y - pad_y)
@@ -762,13 +761,9 @@ def _find_header_and_owner_band(bgr: np.ndarray, row_y: int, x_text0: int, x_tex
     x0 = x_text0
     x1 = int(x_text0 + 0.58 * (x_text1 - x_text0))
     return x0, x1, y0, y1
-    lh = int(h * (0.035 if lines == 1 else 0.06))
-    y0 = max(0, row_y - int(h*0.012)); y1 = min(h, y0 + lh)
-    x0 = x_text0; x1 = int(x_text0 + 0.58*(x_text1-x_text0))
-    return x0, x1, y0, y1
 
 
-def _extract_owner_from_row(bgr: np.ndarray, row_y: int, lines: int = 2) -> Tuple[str, Tuple[int,int,int,int], int]:
+def _extract_owner_from_row(bgr: np.ndarray, row_y: int, lines: int = 2) -> Tuple[str, Tuple[int,int,int,int], int]:(bgr: np.ndarray, row_y: int, lines: int = 2) -> Tuple[str, Tuple[int,int,int,int], int]:
     h, w = bgr.shape[:2]
     x_text0 = int(w * 0.30); x_text1 = int(w * 0.96)
     attempts = []
@@ -1160,6 +1155,7 @@ def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
+
 
 
 
