@@ -409,19 +409,25 @@ def ocr_image_to_data_lines(img_bgr: np.ndarray) -> List[Tuple[str, Tuple[int,in
 
 def extract_name_multiline_from_roi(roi_bgr: np.ndarray) -> str:
     """Une L1 + (L2, L3) dentro de la celda de nombres, de forma robusta.
-    Criterios para considerar que una línea pertenece a la misma columna de Nombre:
-      - Alineación izquierda similar (tolerancia en % del ancho de ROI), o
-      - Solape horizontal de al menos 0.4 IoU con la franja de L1.
-    Controla la separación vertical mediante una cota relativa a la altura media de línea.
+    No limpiamos cada línea por separado para no descartar segundas líneas de 1 token
+    (p.ej., "Pablo"). Limpiamos sólo al final.
+    Criterios L2/L3:
+      - Alineación izquierda similar (tolerancia % ancho ROI) **o** IoU horizontal ≥ 0.40 con L1.
+      - Salto vertical acotado por altura media de línea.
+      - Aceptamos L2/L3 de 1–3 tokens si parecen nombres (GIVEN_NAMES o patrón Capitalizada).
     """
     lines = ocr_image_to_data_lines(roi_bgr)
     if not lines:
         return ""
+
     W = roi_bgr.shape[1]
     tol_x = int(max(2, CFG.l2_align_tol_pct * W))
+
     # Datos de L1
     text0, (x0, y0, w0, h0) = lines[0]
-    base_left = x0; base_right = x0 + w0
+    base_left = x0
+    base_right = x0 + w0
+
     # Altura media de línea
     hs = [bbox[3] for (_t, bbox) in lines]
     med_h = float(np.median(hs)) if hs else max(1.0, h0)
@@ -433,7 +439,8 @@ def extract_name_multiline_from_roi(roi_bgr: np.ndarray) -> str:
         union = (ax1 - ax0) + (bx1 - bx0) - inter
         return inter / max(1.0, union)
 
-    joined = [clean_candidate_text(postprocess_name(text0))]
+    # Empezamos con L1 sin limpiar todavía; limpieza sólo al final
+    joined_raw: list[str] = [postprocess_name(text0)]
     last_bottom = y0 + h0
     used = 1
 
@@ -441,25 +448,51 @@ def extract_name_multiline_from_roi(roi_bgr: np.ndarray) -> str:
         if used >= max(1, CFG.l2_max_lines):
             break
         t, (lx, ly, lw, lh) = lines[i]
+
         # Filtro vertical: no subir y controlar salto excesivo
         if ly < y0:
             continue
         gap = ly - last_bottom
         if gap > CFG.l2_max_gap_factor * med_h:
             continue
+
         # Alineación u overlap horizontal respecto a L1
         aligned = abs(lx - base_left) <= tol_x
-        iou_ok = horiz_iou(lx, lx+lw, base_left, base_right) >= 0.40
+        iou_ok = horiz_iou(lx, lx + lw, base_left, base_right) >= 0.40
         if not (aligned or iou_ok):
             continue
-        cand = clean_candidate_text(postprocess_name(t))
-        if not cand:
+
+        # Texto crudo de la línea, sin limpiar por completo
+        t_raw = drop_anti_header_tokens(postprocess_name(t))
+        toks = [tok for tok in t_raw.split() if tok]
+        if not toks:
             continue
-        joined.append(cand)
+
+        accept = False
+        # Caso típico: una o dos palabras (p.ej., "Pablo", "María Luisa")
+        if 1 <= len(toks) <= 3:
+            if all(not any(ch.isdigit() for ch in tok) for tok in toks):
+                namey = sum(
+                    1 for tok in toks
+                    if strip_accents(tok).upper() in GIVEN_NAMES or re.match(r"^[A-ZÁÉÍÓÚÜÑ][a-záéíóúüñ]{1,}$", tok)
+                )
+                if namey >= 1:
+                    accept = True
+        else:
+            # Si es más larga, comprobar con limpieza clásica
+            tcheck = clean_candidate_text(t_raw)
+            if tcheck:
+                t_raw = tcheck
+                accept = True
+
+        if not accept:
+            continue
+
+        joined_raw.append(" ".join(toks))
         last_bottom = ly + lh
         used += 1
 
-    full = clean_candidate_text(postprocess_name(" ".join([p for p in joined if p])))
+    full = clean_candidate_text(postprocess_name(" ".join([p for p in joined_raw if p])))
     return full
 
 
@@ -1290,6 +1323,7 @@ def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
+
 
 
 
