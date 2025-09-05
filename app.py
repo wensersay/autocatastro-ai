@@ -843,7 +843,12 @@ def _extract_owner_from_row(bgr: np.ndarray, row_y: int, lines: int = 2) -> Tupl
             owner = _pick_owner_from_text(txt)
             if owner:
                 break
-        if not owner:
+        if owner:
+            # Intentar completar con nombre multilínea dentro del ROI (captura L2/L3)
+            owner_ml = extract_name_multiline_from_roi(roi)
+            if owner_ml and (len(owner_ml.split()) > len(owner.split())):
+                owner = owner_ml
+        else:
             rgb = cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
             lines_data = ocr_image_to_data_lines(rgb)
             if lines_data:
@@ -1267,6 +1272,7 @@ def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
+
 
 
 
