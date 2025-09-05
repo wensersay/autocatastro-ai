@@ -62,6 +62,7 @@ class Cfg:
     second_line_force: bool = os.getenv("SECOND_LINE_FORCE", "1") == "1"
     second_line_maxchars: int = int(os.getenv("SECOND_LINE_MAXCHARS", "64"))
     second_line_maxtokens: int = int(os.getenv("SECOND_LINE_MAXTOKENS", "14"))
+    second_line_scan_extra_pct: float = float(os.getenv("SECOND_LINE_SCAN_EXTRA_PCT", "0.03"))  # mini‑tweak: escaneo bajo la banda
 
     neigh_min_area_hard: int = int(os.getenv("NEIGH_MIN_AREA_HARD", "600"))
     neigh_max_dist_ratio: float = float(os.getenv("NEIGH_MAX_DIST_RATIO", "1.8"))
@@ -78,7 +79,7 @@ class Cfg:
 
     diag_to_cardinals: bool = os.getenv("DIAG_TO_CARDINALS", "0") == "1"
 
-    owner_allow_digits: bool = os.getenv("OWNER_ALLOW_DIGITS", "0") == "1"
+    owner_allow_digits: bool = os.getenv("OWNER_ALLOW_DIGITS", "1") == "1"
 
     # Snaps específicos para asignación basada en filas (row)
     row_angle_snap_deg: float = float(os.getenv("ROW_ANGLE_SNAP_DEG", "30"))
@@ -801,6 +802,33 @@ def _extract_owner_from_row(bgr: np.ndarray, row_y: int, lines: int = 2) -> Tupl
 
                     # NUEVO: si L2/L3 son 1–2 tokens y parecen nombres propios, añadirlos al final de L1
                     extra_given: list[str] = []
+                    # Si no se detecta en L2/L3, probar una micro‑banda por debajo del ROI (por si L2 quedó fuera)
+                    if CFG.second_line_scan_extra_pct > 0 and not extra_given:
+                        y0b = min(h - 1, y1 + 1)
+                        y1b = min(h, y1 + max(int(h * CFG.second_line_scan_extra_pct), max(24, int((y1 - y0) * 0.5))))
+                        if y1b > y0b:
+                            roi_below = bgr[y0b:y1b, x0:x1]
+                            if roi_below.size > 0:
+                                gg = cv2.cvtColor(roi_below, cv2.COLOR_BGR2GRAY)
+                                gg = cv2.resize(gg, None, fx=1.35, fy=1.35, interpolation=cv2.INTER_CUBIC)
+                                gg = _enhance_gray(gg)
+                                bw2, bwi2 = _binarize(gg)
+                                WL2 = "ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÜÑabcdefghijklmnopqrstuvwxyzáéíóúüñ '"
+                                cand_below = _ocr_text(bw2, 6, WL2)
+                                if not cand_below:
+                                    cand_below = _ocr_text(bwi2, 6, WL2)
+                                cand_below = postprocess_name(cand_below)
+                                tokb = [t for t in cand_below.split() if t]
+                                # tomar 1–2 tokens iniciales si son nombres propios
+                                buf2: list[str] = []
+                                for t in tokb[:2]:
+                                    up = strip_accents(t).upper()
+                                    if up in GIVEN_NAMES:
+                                        buf2.append(t)
+                                    else:
+                                        break
+                                if 1 <= len(buf2) <= 2:
+                                    extra_given.extend(buf2)
                     for j in (1, 2):
                         if j < len(segs) and segs[j]:
                             toksj = [t for t in segs[j].split() if t]
@@ -1168,5 +1196,6 @@ def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
+
 
 
