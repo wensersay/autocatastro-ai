@@ -264,7 +264,7 @@ def clean_candidate_text(s: str) -> str:
     up = strip_accents(s).upper()
 
     # 3) Defensa frente a símbolos / rótulos
-    for ch in ["=", "*", "_", "/", "\", "|", "[", "]", "{", "}", "<", ">"]:
+    for ch in ["=", "*", "_", "/", "\\", "|", "[", "]", "{", "}", "<", ">"]:
         if ch in up:
             return ""
     STOP = {
@@ -968,6 +968,7 @@ def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
+
 
 
 
