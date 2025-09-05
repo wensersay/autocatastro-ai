@@ -902,7 +902,7 @@ def detect_rows_and_extract8(bgr: np.ndarray) -> Tuple[Dict[str,List[str]], dict
         if side and owner:
             if owner not in ldr[side]:
                 ldr[side].append(owner); used_rows += 1
-        rows_dbg.append({"row_y": mcy, "main_center": [mcx, mcy], "neigh_center": list(best) if best else None, "side": side, "owner": owner, "roi_attempt": attempt_id, "row_angle": row_angle, "snapped_to": snapped_to})"row_y": mcy, "main_center": [mcx, mcy], "neigh_center": list(best) if best else None, "side": side, "owner": owner, "roi_attempt": attempt_id})
+        rows_dbg.append({"row_y": mcy, "main_center": [mcx, mcy], "neigh_center": list(best) if best else None, "side": side, "owner": owner, "roi_attempt": attempt_id, "row_angle": row_angle, "snapped_to": snapped_to})
     return ldr, {"rows": rows_dbg, "used_rows": used_rows}
 
 # ----------------------------------------
@@ -1128,6 +1128,7 @@ def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
+
 
 
 
