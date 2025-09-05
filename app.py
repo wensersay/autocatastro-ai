@@ -408,22 +408,32 @@ def ocr_image_to_data_lines(img_bgr: np.ndarray) -> List[Tuple[str, Tuple[int,in
 
 
 def extract_name_multiline_from_roi(roi_bgr: np.ndarray) -> str:
-    """Une L1 + (L2, L3) dentro de la celda de nombres, usando alineación izquierda y separación vertical.
-    Funciona con cualquier nombre compuesto que continúe en segunda línea (o tercera) sin depender de listas fijas.
+    """Une L1 + (L2, L3) dentro de la celda de nombres, de forma robusta.
+    Criterios para considerar que una línea pertenece a la misma columna de Nombre:
+      - Alineación izquierda similar (tolerancia en % del ancho de ROI), o
+      - Solape horizontal de al menos 0.4 IoU con la franja de L1.
+    Controla la separación vertical mediante una cota relativa a la altura media de línea.
     """
     lines = ocr_image_to_data_lines(roi_bgr)
     if not lines:
         return ""
-    # Medidas generales de la ROI
     W = roi_bgr.shape[1]
     tol_x = int(max(2, CFG.l2_align_tol_pct * W))
-    # Altura media de línea para controlar el salto permitido
-    hs = [bbox[3] for (_t, bbox) in lines]
-    med_h = float(np.median(hs)) if hs else 0.0
-
-    # Anclamos en la primera línea
+    # Datos de L1
     text0, (x0, y0, w0, h0) = lines[0]
-    joined = [text0]
+    base_left = x0; base_right = x0 + w0
+    # Altura media de línea
+    hs = [bbox[3] for (_t, bbox) in lines]
+    med_h = float(np.median(hs)) if hs else max(1.0, h0)
+
+    def horiz_iou(ax0, ax1, bx0, bx1) -> float:
+        inter = max(0, min(ax1, bx1) - max(ax0, bx0))
+        if inter <= 0:
+            return 0.0
+        union = (ax1 - ax0) + (bx1 - bx0) - inter
+        return inter / max(1.0, union)
+
+    joined = [clean_candidate_text(postprocess_name(text0))]
     last_bottom = y0 + h0
     used = 1
 
@@ -431,14 +441,17 @@ def extract_name_multiline_from_roi(roi_bgr: np.ndarray) -> str:
         if used >= max(1, CFG.l2_max_lines):
             break
         t, (lx, ly, lw, lh) = lines[i]
-        # Alineación izquierda similar a L1
-        if abs(lx - x0) > tol_x:
+        # Filtro vertical: no subir y controlar salto excesivo
+        if ly < y0:
             continue
-        # Separación vertical razonable
-        if med_h:
-            gap = ly - last_bottom
-            if gap > CFG.l2_max_gap_factor * med_h:
-                continue
+        gap = ly - last_bottom
+        if gap > CFG.l2_max_gap_factor * med_h:
+            continue
+        # Alineación u overlap horizontal respecto a L1
+        aligned = abs(lx - base_left) <= tol_x
+        iou_ok = horiz_iou(lx, lx+lw, base_left, base_right) >= 0.40
+        if not (aligned or iou_ok):
+            continue
         cand = clean_candidate_text(postprocess_name(t))
         if not cand:
             continue
@@ -446,8 +459,7 @@ def extract_name_multiline_from_roi(roi_bgr: np.ndarray) -> str:
         last_bottom = ly + lh
         used += 1
 
-    full = postprocess_name(" ".join(joined))
-    full = clean_candidate_text(full)
+    full = clean_candidate_text(postprocess_name(" ".join([p for p in joined if p])))
     return full
 
 
@@ -845,9 +857,15 @@ def _extract_owner_from_row(bgr: np.ndarray, row_y: int, lines: int = 2) -> Tupl
                 break
         if owner:
             # Intentar completar con nombre multilínea dentro del ROI (captura L2/L3)
-            owner_ml = extract_name_multiline_from_roi(roi)
-            if owner_ml and (len(owner_ml.split()) > len(owner.split())):
-                owner = owner_ml
+            # Expandimos la ROI hacia abajo para intentar capturar L2/L3
+            y_extra = int(max((y1 - y0) * 0.8, roi.shape[0] * 0.5)) if roi.size else 0
+            y1e = min(bgr.shape[0], y1 + max(8, int(max(CFG.second_line_scan_extra_pct * bgr.shape[0], y_extra))))
+            roi_ext = bgr[y0:y1e, x0:x1]
+            owner_ml = extract_name_multiline_from_roi(roi_ext)
+            # Preferimos la versión multilínea si añade tokens o contiene al nombre base
+            if owner_ml:
+                if len(owner_ml.split()) > len(owner.split()) or owner_ml.startswith(owner.split()[0]):
+                    owner = owner_ml
         else:
             rgb = cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
             lines_data = ocr_image_to_data_lines(rgb)
