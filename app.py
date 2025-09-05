@@ -264,7 +264,7 @@ def clean_candidate_text(s: str) -> str:
     up = strip_accents(s).upper()
 
     # 3) Defensa frente a símbolos / rótulos
-    for ch in ["=", "*", "_", "/", "\", "|", "[", "]", "{", "}", "<", ">"]:
+    for ch in ["=", "*", "_", "/", "\\", "|", "[", "]", "{", "}", "<", ">"]:
         if ch in up:
             return ""
     STOP = {
