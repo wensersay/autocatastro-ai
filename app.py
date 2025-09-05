@@ -19,7 +19,6 @@ Variables recomendadas (Railway → Variables):
 - DIAG_KEEP_DOMINANCE=0.55, CARD_PAIR_MIN_EACH=0.20, CARD_PAIR_MIN_COMBINED=0.50, CARD_SINGLE_MIN=0.30
 - DIAG_TO_CARDINALS=0
 - OWNER_ALLOW_DIGITS=0
-- ANTI_HEADER_KWS=TITULARIDAD|PRINCIPAL|TITULAR|SECUNDARIA|S/S|SS
 """
 from __future__ import annotations
 
@@ -81,7 +80,6 @@ class Cfg:
 
     owner_allow_digits: bool = os.getenv("OWNER_ALLOW_DIGITS", "0") == "1"
 
-    # NUEVO: lista de tokens de cabecera a eliminar de candidatos
     anti_header_kws: List[str] = field(default_factory=lambda: [
         s.strip() for s in os.getenv("ANTI_HEADER_KWS", "TITULARIDAD|PRINCIPAL|TITULAR|SECUNDARIA|S/S|SS").split("|")
         if s.strip()
@@ -161,7 +159,6 @@ def require_token(credentials: Optional[HTTPAuthorizationCredentials] = Depends(
 def strip_accents(s: str) -> str:
     return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
 
-# NUEVO: set con tokens de cabecera a filtrar
 ANTI_HEADER = set(strip_accents(s).upper() for s in CFG.anti_header_kws)
 
 LOWER_CONNECTORS = {"de","del","la","las","los","y","da","do","das","dos"}
@@ -234,10 +231,6 @@ def looks_like_address(s: str) -> bool:
 
 
 def drop_anti_header_tokens(s: str) -> str:
-    """
-    Elimina tokens típicos de cabecera de tabla (p. ej. 'Titularidad', 'Principal', 'SS', 'S/S') de un candidato.
-    Mantiene el resto del nombre.
-    """
     if not s:
         return ""
     toks = s.strip().split()
@@ -258,13 +251,20 @@ def clean_candidate_text(s: str) -> str:
     # 1) Quitar tokens de cabecera de tabla
     s = drop_anti_header_tokens(s)
 
-    # 2) Sanitizar
-    s = re.sub(r"[^0-9A-Za-zÁÉÍÓÚÜÑáéíóúüñ .'-]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip(" .-'")
+    # 2) Sanitizar sin regex
+    out_chars = []
+    for ch in s:
+        cat = unicodedata.category(ch)
+        if cat.startswith('L') or cat.startswith('N') or ch in " .'-":
+            out_chars.append(ch)
+        else:
+            out_chars.append(' ')
+    s = "".join(out_chars)
+    s = " ".join(s.split()).strip(" .-'")
     up = strip_accents(s).upper()
 
     # 3) Defensa frente a símbolos / rótulos
-    for ch in ["=", "*", "_", "/", "\\", "|", "[", "]", "{", "}", "<", ">"]:
+    for ch in ["=", "*", "_", "/", "\", "|", "[", "]", "{", "}", "<", ">"]:
         if ch in up:
             return ""
     STOP = {
@@ -278,14 +278,44 @@ def clean_candidate_text(s: str) -> str:
     # 4) Direcciones / números
     if looks_like_address(up):
         return ""
-    if not CFG.owner_allow_digits and re.search(r"\d", up):
-        if not re.search(r"\b(S\.?L\.?|S\.?A\.?|SCOOP\.?|COOP\.?|CB)\b", up):
+    if not CFG.owner_allow_digits and any(c.isdigit() for c in up):
+        if not any(tok in up for tok in ("S.L","S L","S.A","S A","SCOOP","COOP"," CB","CB ")):
             return ""
 
     # 5) Requiere al menos 2 tokens "de nombre"
     tokens = s.split()
     good = [t for t in tokens if (len(t) >= 2 and (t[0].isupper() or t.isupper()))]
     return " ".join(tokens[:7]) if len(good) >= 2 else ""
+
+# --- Normalización y similitud de titulares (dedupe row+color) ---
+TOKEN_STOP = set(t.upper() for t in NAME_CONNECTORS)
+
+def _norm_tokens_for_match(s: str) -> List[str]:
+    s = strip_accents((s or "")).upper()
+    s = re.sub(r"[^A-Z0-9\s]", " ", s)
+    toks = [t for t in s.split() if t and t not in TOKEN_STOP]
+    # quitar tokens de 1 letra y números aislados
+    toks = [t for t in toks if (len(t) > 1 and not t.isdigit())]
+    return toks
+
+def _jaccard(a: List[str], b: List[str]) -> float:
+    if not a or not b:
+        return 0.0
+    sa, sb = set(a), set(b)
+    inter = len(sa & sb)
+    union = len(sa | sb) or 1
+    return inter / union
+
+def same_person(a: str, b: str) -> bool:
+    ta = _norm_tokens_for_match(a)
+    tb = _norm_tokens_for_match(b)
+    if not ta or not tb:
+        return False
+    # contención fuerte o jaccard alto
+    sa, sb = set(ta), set(tb)
+    if len(sa) >= 2 and (sa <= sb or sb <= sa):
+        return True
+    return _jaccard(ta, tb) >= 0.7
 
 # ----------------------------------------
 # OCR básicos
@@ -451,15 +481,43 @@ def sector_coverage(subj_c: Tuple[int,int], contour: np.ndarray, step: int = 8) 
 
 
 def decide_sides_smart(cov: Dict[str, float]) -> List[str]:
+    # 1) Si ambos cardinales contiguos superan umbral, asignar ambos
     for diag, (a, b) in PAIRS.items():
         if cov[a] >= CFG.card_pair_min_each and cov[b] >= CFG.card_pair_min_each and (cov[a] + cov[b]) >= CFG.card_pair_min_combined:
             return [a, b]
+
+    # 2) Mejor lado por cobertura bruta
     best_side = max(SIDES8, key=lambda s: cov.get(s, 0.0))
+
+    # 3) Mantener diagonal solo si es realmente dominante
     if best_side in PAIRS:
         a, b = PAIRS[best_side]
         if cov[best_side] >= CFG.diag_keep_dominance and cov[a] < CFG.card_pair_min_each and cov[b] < CFG.card_pair_min_each:
             return [best_side]
+
+    # 4) Si una pareja cardinal suma fuerte y cada uno pasa mínimo, usar pareja
     card_pairs = [("norte","este"),("este","sur"),("sur","oeste"),("oeste","norte")]
+    best_pair: Optional[Tuple[str,str]] = None
+    best_sum = 0.0
+    for a,b in card_pairs:
+        s = cov[a] + cov[b]
+        if cov[a] >= CFG.card_single_min and cov[b] >= CFG.card_single_min and s > best_sum:
+            best_sum = s; best_pair = (a,b)
+    if best_pair:
+        return list(best_pair)
+
+    # 5) Democión de diagonal con ventaja débil hacia el cardinal dominante
+    if best_side in PAIRS:
+        a, b = PAIRS[best_side]
+        if cov[best_side] < CFG.diag_keep_dominance:
+            # elegir el cardinal más fuerte si pasa el mínimo individual
+            best_card, best_val = (a, cov[a]) if cov[a] >= cov[b] else (b, cov[b])
+            if best_val >= CFG.card_single_min:
+                return [best_card]
+
+    # 6) En última instancia, devolver el mejor lado bruto
+    return [best_side]
+card_pairs = [("norte","este"),("este","sur"),("sur","oeste"),("oeste","norte")]
     best_pair: Optional[Tuple[str,str]] = None
     best_sum = 0.0
     for a,b in card_pairs:
@@ -809,16 +867,54 @@ def process_pdf(pdf_bytes: bytes) -> ExtractResult:
             debug_rows.append({"neighbor_bbox": list(nb["bbox"]), "centroid": list(nb["centroid"]), "coverage": coverage, "assigned": sides, "owner": name})
 
     # 3) Fusión (prioridad a row-based)
-    ldr_out: Dict[str, List[str]] = {k: [] for k in SIDE_ORDER}
-    for side in SIDE_ORDER:
-        seen = set()
-        for src in (ldr_row.get(side, []), ldr_color.get(side, [])):
-            for nm in src:
-                nm_pp = clean_candidate_text(postprocess_name(nm))
-                if nm_pp and nm_pp not in seen:
-                    ldr_out[side].append(nm_pp); seen.add(nm_pp)
+# 3.a) Canonizar lista de titulares encontrados por tabla (row)
+row_canon: List[str] = []
+for side in SIDE_ORDER:
+    for nm in (ldr_row.get(side, []) or []):
+        nm_pp = clean_candidate_text(postprocess_name(nm))
+        if nm_pp and all(not same_person(nm_pp, ex) for ex in row_canon):
+            row_canon.append(nm_pp)
 
-    # 4) Vaciar diagonales si hay sus dos cardinales presentes (preferencia notarial)
+# 3.b) Inicializar salida con los row tal cual por lado
+ldr_out: Dict[str, List[str]] = {k: [] for k in SIDE_ORDER}
+for side in SIDE_ORDER:
+    seen_side: List[str] = []
+    for nm in (ldr_row.get(side, []) or []):
+        nm_pp = clean_candidate_text(postprocess_name(nm))
+        if nm_pp and all(not same_person(nm_pp, ex) for ex in seen_side):
+            ldr_out[side].append(nm_pp)
+            seen_side.append(nm_pp)
+
+# 3.c) Añadir color mapeando a canónicos de row si son la misma persona
+for side in SIDE_ORDER:
+    for nm in (ldr_color.get(side, []) or []):
+        nm_pp = clean_candidate_text(postprocess_name(nm))
+        if not nm_pp:
+            continue
+        # mapear a canónico de row si hace match
+        mapped = None
+        for r in row_canon:
+            if same_person(nm_pp, r):
+                mapped = r
+                break
+        candidate = mapped or nm_pp
+        # evitar duplicados dentro del lado por similitud
+        if any(same_person(candidate, ex) for ex in ldr_out[side]):
+            continue
+        ldr_out[side].append(candidate)
+
+# 3.d) Limpiar diagonales por titular: si aparece en sus cardinales, quitar de diagonal
+for diag, (a, b) in PAIRS.items():
+    if ldr_out[diag]:
+        keep = []
+        for nm in ldr_out[diag]:
+            if any(same_person(nm, ex) for ex in (ldr_out[a] + ldr_out[b])):
+                continue
+            keep.append(nm)
+        ldr_out[diag] = keep
+
+# 4) Vaciar diagonales si hay sus dos cardinales presentes (preferencia notarial)
+ si hay sus dos cardinales presentes (preferencia notarial)
     for diag, (a, b) in {"noreste": ("norte","este"), "sureste": ("sur","este"), "suroeste": ("sur","oeste"), "noroeste": ("norte","oeste")}.items():
         if ldr_out[a] and ldr_out[b]:
             ldr_out[diag] = []
@@ -884,5 +980,6 @@ def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
+
 
 
