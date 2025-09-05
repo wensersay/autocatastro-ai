@@ -264,7 +264,7 @@ def clean_candidate_text(s: str) -> str:
     up = strip_accents(s).upper()
 
     # 3) Defensa frente a símbolos / rótulos
-    for ch in ["=", "*", "_", "/", "\\", "|", "[", "]", "{", "}", "<", ">"]:
+    for ch in ["=", "*", "_", "/", "\", "|", "[", "]", "{", "}", "<", ">"]:
         if ch in up:
             return ""
     STOP = {
@@ -517,7 +517,6 @@ def decide_sides_smart(cov: Dict[str, float]) -> List[str]:
 
     # 6) En última instancia, devolver el mejor lado bruto
     return [best_side]
-
 # ----------------------------------------
 # OCR cerca del vecino (fallback)
 # ----------------------------------------
@@ -836,11 +835,13 @@ def process_pdf(pdf_bytes: bytes) -> ExtractResult:
     if subj:
         subj_c = subj["centroid"]
         sx, sy, sw, sh = subj["bbox"]
+
         def dist_to_rect(cx: int, cy: int, rect: Tuple[int,int,int,int]) -> float:
             x, y, w, h = rect
             dx = max(x - cx, 0, cx - (x + w))
             dy = max(y - cy, 0, cy - (y + h))
             return math.hypot(dx, dy)
+
         maxd = CFG.neigh_max_dist_ratio * max(sw, sh)
         neigh = [nb for nb in neigh if dist_to_rect(nb["centroid"][0], nb["centroid"][1], subj["bbox"]) <= maxd]
         for nb in neigh[:12]:
@@ -857,53 +858,51 @@ def process_pdf(pdf_bytes: bytes) -> ExtractResult:
             debug_rows.append({"neighbor_bbox": list(nb["bbox"]), "centroid": list(nb["centroid"]), "coverage": coverage, "assigned": sides, "owner": name})
 
     # 3) Fusión (prioridad a row-based)
-# 3.a) Canonizar lista de titulares encontrados por tabla (row)
-row_canon: List[str] = []
-for side in SIDE_ORDER:
-    for nm in (ldr_row.get(side, []) or []):
-        nm_pp = clean_candidate_text(postprocess_name(nm))
-        if nm_pp and all(not same_person(nm_pp, ex) for ex in row_canon):
-            row_canon.append(nm_pp)
+    # 3.a) Canonizar lista de titulares encontrados por tabla (row)
+    row_canon: List[str] = []
+    for side in SIDE_ORDER:
+        for nm in (ldr_row.get(side, []) or []):
+            nm_pp = clean_candidate_text(postprocess_name(nm))
+            if nm_pp and all(not same_person(nm_pp, ex) for ex in row_canon):
+                row_canon.append(nm_pp)
 
-# 3.b) Inicializar salida con los row tal cual por lado
-ldr_out: Dict[str, List[str]] = {k: [] for k in SIDE_ORDER}
-for side in SIDE_ORDER:
-    seen_side: List[str] = []
-    for nm in (ldr_row.get(side, []) or []):
-        nm_pp = clean_candidate_text(postprocess_name(nm))
-        if nm_pp and all(not same_person(nm_pp, ex) for ex in seen_side):
-            ldr_out[side].append(nm_pp)
-            seen_side.append(nm_pp)
+    # 3.b) Inicializar salida con los row tal cual por lado
+    ldr_out: Dict[str, List[str]] = {k: [] for k in SIDE_ORDER}
+    for side in SIDE_ORDER:
+        seen_side: List[str] = []
+        for nm in (ldr_row.get(side, []) or []):
+            nm_pp = clean_candidate_text(postprocess_name(nm))
+            if nm_pp and all(not same_person(nm_pp, ex) for ex in seen_side):
+                ldr_out[side].append(nm_pp)
+                seen_side.append(nm_pp)
 
-# 3.c) Añadir color mapeando a canónicos de row si son la misma persona
-for side in SIDE_ORDER:
-    for nm in (ldr_color.get(side, []) or []):
-        nm_pp = clean_candidate_text(postprocess_name(nm))
-        if not nm_pp:
-            continue
-        # mapear a canónico de row si hace match
-        mapped = None
-        for r in row_canon:
-            if same_person(nm_pp, r):
-                mapped = r
-                break
-        candidate = mapped or nm_pp
-        # evitar duplicados dentro del lado por similitud
-        if any(same_person(candidate, ex) for ex in ldr_out[side]):
-            continue
-        ldr_out[side].append(candidate)
-
-# 3.d) Limpiar diagonales por titular: si aparece en sus cardinales, quitar de diagonal
-for diag, (a, b) in PAIRS.items():
-    if ldr_out[diag]:
-        keep = []
-        for nm in ldr_out[diag]:
-            if any(same_person(nm, ex) for ex in (ldr_out[a] + ldr_out[b])):
+    # 3.c) Añadir color mapeando a canónicos de row si son la misma persona
+    for side in SIDE_ORDER:
+        for nm in (ldr_color.get(side, []) or []):
+            nm_pp = clean_candidate_text(postprocess_name(nm))
+            if not nm_pp:
                 continue
-            keep.append(nm)
-        ldr_out[diag] = keep
+            mapped = None
+            for r in row_canon:
+                if same_person(nm_pp, r):
+                    mapped = r
+                    break
+            candidate = mapped or nm_pp
+            if any(same_person(candidate, ex) for ex in ldr_out[side]):
+                continue
+            ldr_out[side].append(candidate)
 
-# 4) Vaciar diagonales si hay sus dos cardinales presentes (preferencia notarial)
+    # 3.d) Limpiar diagonales por titular: si aparece en sus cardinales, quitar de diagonal
+    for diag, (a, b) in PAIRS.items():
+        if ldr_out[diag]:
+            keep = []
+            for nm in ldr_out[diag]:
+                if any(same_person(nm, ex) for ex in (ldr_out[a] + ldr_out[b])):
+                    continue
+                keep.append(nm)
+            ldr_out[diag] = keep
+
+    # 4) Vaciar diagonales si hay sus dos cardinales presentes (preferencia notarial)
     for diag, (a, b) in {"noreste": ("norte","este"), "sureste": ("sur","este"), "suroeste": ("sur","oeste"), "noroeste": ("norte","oeste")}.items():
         if ldr_out[a] and ldr_out[b]:
             ldr_out[diag] = []
@@ -969,7 +968,6 @@ def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
-
 
 
 
