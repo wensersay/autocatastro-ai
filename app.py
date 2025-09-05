@@ -225,13 +225,56 @@ def propercase_spanish(s: str) -> str:
 
 
 def reorder_surname_first(s: str) -> str:
+    """Si el/los *últimos* tokens son nombre(s) de pila (1–2), muévelos delante.
+    Ej.: "Pérez Taboada Julio" → "Julio Pérez Taboada";
+         "Rodríguez Álvarez José Ramón" → "José Ramón Rodríguez Álvarez".
     """
-    Si el/los nombres propios están al final (1 o 2 tokens), muévelos delante.
-    Ej.: 'Lopez Lopez Maria Luisa' → 'María Luisa López López'
-         'Pombo Sanchez Sergio'   → 'Sergio Pombo Sánchez'
-    """
-    if not s:
+    toks = s.split()
+    if len(toks) < 2:
         return s
+
+    tail: list[str] = []
+    i = len(toks) - 1
+    # Tomamos hasta 2 nombres al final
+    for _ in range(2):
+        if i < 0:
+            break
+        up = strip_accents(toks[i]).upper()
+        if up in GIVEN_NAMES:
+            tail.append(toks[i])
+            i -= 1
+            continue
+        break
+
+    if tail:
+        tail = list(reversed(tail))
+        rest = toks[: i + 1]
+        return " ".join(tail + rest)
+    return s
+
+HONORIFICS = {
+    "D","D.","Dª","D.ª","DÑA","DOÑA","DON","SR","SR.","SRA","SRA.","SRES.",
+    "EXCMO.","EXCMA.","ILMO.","ILMA.",
+}
+
+def strip_honorifics_and_initials(s: str) -> str:
+    """Elimina tratamientos (D., Don, Doña, Sr., …) y **iniciales sueltas** al inicio,
+    p.ej. "A"/"A." que a veces aparece por OCR. Conserva conectores como "y".
+    """
+    toks = s.split()
+    while toks:
+        if not toks:
+            break
+        t0 = toks[0]
+        up0 = strip_accents(t0).upper()
+        # Inicial suelta de 1-2 chars (no "y") o tratamiento
+        if (len(t0) <= 2 and up0 not in {"Y"}) or (up0 in HONORIFICS):
+            # Quitar también variantes con punto (p. ej. "A.")
+            if up0 in HONORIFICS or re.match(r"^[A-Z]\.?$", t0):
+                toks = toks[1:]
+                continue
+        break
+    return " ".join(toks)
     toks = [t for t in re.split(r"\s+", s.strip()) if t]
     if len(toks) < 2:
         return s
@@ -269,6 +312,7 @@ def postprocess_name(text: str) -> str:
             s = f"{parts[1]} {parts[0]}"
     s = s.replace("  ", " ")
     s = re.sub(r"\b(TITULAR EN INVESTIGACION|TITULAR EN INVESTIGACIÓN)\b", "Titular en investigación", s, flags=re.I)
+    s = strip_honorifics_and_initials(s)
     s = propercase_spanish(s)
     s = reorder_surname_first(s)
     return s
@@ -1331,6 +1375,7 @@ def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
+
 
 
 
