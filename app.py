@@ -80,6 +80,8 @@ class Cfg:
 
     owner_allow_digits: bool = os.getenv("OWNER_ALLOW_DIGITS", "0") == "1"
 
+    angle_snap_deg: float = float(os.getenv("ANGLE_SNAP_DEG", "18"))
+
     anti_header_kws: List[str] = field(default_factory=lambda: [
         s.strip() for s in os.getenv("ANTI_HEADER_KWS", "TITULARIDAD|PRINCIPAL|TITULAR|SECUNDARIA|S/S|SS").split("|")
         if s.strip()
@@ -475,6 +477,31 @@ PAIRS = {
     "noroeste": ("norte", "oeste"),
 }
 
+CARDINAL_CENTERS = {
+    "este": 0.0, "noreste": 45.0, "norte": 90.0, "noroeste": 135.0,
+    "oeste": 180.0, "suroeste": 225.0, "sur": 270.0, "sureste": 315.0,
+}
+
+def _ang_dist(a: float, b: float) -> float:
+    d = abs((a - b) % 360.0)
+    return min(d, 360.0 - d)
+
+def snap_diagonal_to_cardinal_by_angle(diag: str, angle: float, cov: Dict[str, float]) -> Optional[str]:
+    """Si un vecino cae angularmente muy cerca de un cardinal, preferir el cardinal.
+    Se requiere además algo de cobertura en ese cardinal para robustez.
+    """
+    if diag not in PAIRS:
+        return None
+    a, b = PAIRS[diag]
+    da = _ang_dist(angle, CARDINAL_CENTERS[a])
+    db = _ang_dist(angle, CARDINAL_CENTERS[b])
+    thr = CFG.angle_snap_deg
+    cand = None
+    if da <= db and da <= thr and cov.get(a, 0.0) >= max(0.22, 0.8 * CFG.card_single_min):
+        cand = a
+    elif db < da and db <= thr and cov.get(b, 0.0) >= max(0.22, 0.8 * CFG.card_single_min):
+        cand = b
+    return cand
 
 def angle_between(p0: Tuple[int, int], p1: Tuple[int, int]) -> float:
     dx = p1[0] - p0[0]; dy = p1[1] - p0[1]
@@ -720,12 +747,19 @@ def _extract_owner_from_row(bgr: np.ndarray, row_y: int, lines: int = 2) -> Tupl
             rgb = cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
             lines_data = ocr_image_to_data_lines(rgb)
             if lines_data:
-                joined = lines_data[0][0]
-                if len(lines_data) >= 2:
-                    below = lines_data[1][0].strip()
-                    if 0 < len(below) <= CFG.second_line_maxchars and len(below.split()) <= CFG.second_line_maxtokens:
-                        joined = f"{joined} {below}"
-                owner = _pick_owner_from_text(joined)
+                k = min(3, len(lines_data))
+                parts: List[str] = []
+                for j in range(k):
+                    seg = (lines_data[j][0] or "").strip()
+                    if not seg:
+                        continue
+                    if j == 0 or (len(seg) <= CFG.second_line_maxchars and len(seg.split()) <= CFG.second_line_maxtokens):
+                        parts.append(seg)
+                if parts:
+                    joined = " ".join(parts)
+                    owner = _pick_owner_from_text(joined)
+                    if not owner:
+                        owner = _pick_owner_from_text(reorder_surname_first(joined))
         owner = clean_candidate_text(postprocess_name(owner))
         attempts.append((attempt, x0,y0,x1,y1, owner))
         if owner and len(owner) >= 6:
@@ -882,7 +916,13 @@ def process_pdf(pdf_bytes: bytes) -> ExtractResult:
         neigh = [nb for nb in neigh if dist_to_rect(nb["centroid"][0], nb["centroid"][1], subj["bbox"]) <= maxd]
         for nb in neigh[:12]:
             coverage = sector_coverage(subj_c, nb["contour"], step=8)
-            sides = decide_sides_smart(coverage) if CFG.sector_assign_mode == "smart" else [angle_to_8(angle_between(subj_c, nb["centroid"]))]
+            angle_val = angle_between(subj_c, nb["centroid"])
+            sides = decide_sides_smart(coverage) if CFG.sector_assign_mode == "smart" else [angle_to_8(angle_val)]
+            # snap diagonal → cardinal por ángulo si procede
+            if len(sides) == 1 and sides[0] in PAIRS:
+                snapped = snap_diagonal_to_cardinal_by_angle(sides[0], angle_val, coverage)
+                if snapped:
+                    sides = [snapped]
             name = ocr_name_near_with_linejoin(bgr, nb["bbox"], subj_c)
             if not name:
                 continue
@@ -1008,6 +1048,5 @@ def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
-
 
 
