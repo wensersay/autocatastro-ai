@@ -63,7 +63,7 @@ class Cfg:
     second_line_maxchars: int = int(os.getenv("SECOND_LINE_MAXCHARS", "64"))
     second_line_maxtokens: int = int(os.getenv("SECOND_LINE_MAXTOKENS", "14"))
     second_line_scan_extra_pct: float = float(os.getenv("SECOND_LINE_SCAN_EXTRA_PCT", "0.03"))  # mini‑tweak: escaneo bajo la banda
-    second_line_scan_max_pct: float = float(os.getenv("SECOND_LINE_SCAN_MAX_PCT", "0.06"))  # límite superior del escaneo escalonado
+    second_line_scan_max_pct: float = float(os.getenv("SECOND_LINE_SCAN_MAX_PCT", "0.06"))     # límite superior del escaneo escalonado
 
     neigh_min_area_hard: int = int(os.getenv("NEIGH_MIN_AREA_HARD", "600"))
     neigh_max_dist_ratio: float = float(os.getenv("NEIGH_MAX_DIST_RATIO", "1.8"))
@@ -79,6 +79,11 @@ class Cfg:
     card_single_min: float = float(os.getenv("CARD_SINGLE_MIN", "0.28"))
 
     diag_to_cardinals: bool = os.getenv("DIAG_TO_CARDINALS", "0") == "1"
+
+    # Multilínea robusto en columna de Nombres: alineación y separación vertical
+    l2_align_tol_pct: float = float(os.getenv("L2_ALIGN_TOL_PCT", "0.12"))
+    l2_max_gap_factor: float = float(os.getenv("L2_MAX_GAP_FACTOR", "1.8"))
+    l2_max_lines: int = int(os.getenv("L2_MAX_LINES", "3"))
 
     owner_allow_digits: bool = os.getenv("OWNER_ALLOW_DIGITS", "1") == "1"
 
@@ -400,6 +405,50 @@ def ocr_image_to_data_lines(img_bgr: np.ndarray) -> List[Tuple[str, Tuple[int,in
         out.append((text_line, (x0,y0,x1-x0,y1-y0)))
     out.sort(key=lambda t: t[1][1])
     return out
+
+
+def extract_name_multiline_from_roi(roi_bgr: np.ndarray) -> str:
+    """Une L1 + (L2, L3) dentro de la celda de nombres, usando alineación izquierda y separación vertical.
+    Funciona con cualquier nombre compuesto que continúe en segunda línea (o tercera) sin depender de listas fijas.
+    """
+    lines = ocr_image_to_data_lines(roi_bgr)
+    if not lines:
+        return ""
+    # Medidas generales de la ROI
+    W = roi_bgr.shape[1]
+    tol_x = int(max(2, CFG.l2_align_tol_pct * W))
+    # Altura media de línea para controlar el salto permitido
+    hs = [bbox[3] for (_t, bbox) in lines]
+    med_h = float(np.median(hs)) if hs else 0.0
+
+    # Anclamos en la primera línea
+    text0, (x0, y0, w0, h0) = lines[0]
+    joined = [text0]
+    last_bottom = y0 + h0
+    used = 1
+
+    for i in range(1, len(lines)):
+        if used >= max(1, CFG.l2_max_lines):
+            break
+        t, (lx, ly, lw, lh) = lines[i]
+        # Alineación izquierda similar a L1
+        if abs(lx - x0) > tol_x:
+            continue
+        # Separación vertical razonable
+        if med_h:
+            gap = ly - last_bottom
+            if gap > CFG.l2_max_gap_factor * med_h:
+                continue
+        cand = clean_candidate_text(postprocess_name(t))
+        if not cand:
+            continue
+        joined.append(cand)
+        last_bottom = ly + lh
+        used += 1
+
+    full = postprocess_name(" ".join(joined))
+    full = clean_candidate_text(full)
+    return full
 
 
 def ocr_best_of_three(crop_bgr: np.ndarray) -> str:
@@ -1226,6 +1275,7 @@ def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
+
 
 
 
