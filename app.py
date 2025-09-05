@@ -263,6 +263,32 @@ def strip_honorifics_and_initials(s: str) -> str:
     t = " ".join(cleaned).strip(" -.,;:")
     return t
 
+def normalize_given_pair_order(s: str) -> str:
+    """Corrige orden cuando los nombres de pila vienen al final por salto de línea
+    u OCR (p.ej. \"Martínez Rodríguez Juan Pablo\" → \"Juan Pablo Martínez Rodríguez\").
+    Conserva conectores (de, del, y, …) y no toca si ya empieza por nombre propio.
+    """
+    if not s:
+        return s
+    toks = [t for t in re.split(r"\s+", s.strip()) if t]
+    if len(toks) < 3:
+        return s
+    norm = [strip_accents(t).upper() for t in toks]
+    is_given = [n in GIVEN_NAMES for n in norm]
+
+    # Caso 1: terminación con dos nombres de pila
+    if len(toks) >= 4 and is_given[-1] and is_given[-2] and not is_given[0]:
+        reordered = toks[-2:] + toks[:-2]
+        return " ".join(reordered)
+
+    # Caso 2: terminación con un nombre de pila y el resto no parecen nombres
+    if is_given[-1] and not any(is_given[:-1]):
+        reordered = [toks[-1]] + toks[:-1]
+        return " ".join(reordered)
+
+    return s
+
+
 def reorder_surname_first(s: str) -> str:
     """Si el/los *últimos* tokens son nombre(s) de pila (1–2), muévelos delante.
     Ej.: "Pérez Taboada Julio" → "Julio Pérez Taboada";
@@ -1347,9 +1373,6 @@ def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
-
-
-
 
 
 
