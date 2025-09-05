@@ -181,10 +181,13 @@ LOWER_CONNECTORS = {"de","del","la","las","los","y","da","do","das","dos"}
 ACCENT_MAP = {
     "JOSE": "José", "RODRIGUEZ": "Rodríguez", "ALVAREZ": "Álvarez", "LOPEZ": "López",
     "FERNANDEZ": "Fernández", "VAZQUEZ": "Vázquez", "MARTIN": "Martín", "MARTINEZ": "Martínez",
-    "PEREZ": "Pérez", "GOMEZ": "Gómez", "GARCIA": "García", "NUNEZ": "Núñez", "MARIA": "María",
-    "SANCHEZ": "Sánchez", "SAVINAO": "Saviñao", "MUNOZ": "Muñoz", "LUISA": "Luisa"
+    "PEREZ": "Pérez", "GOMEZ": "Gómez", "GARCIA": "García", "NUNEZ": "Núñez",
+    "SANCHEZ": "Sánchez", "RAMON": "Ramón", "SAVINAO": "Saviñao"
 }
-GIVEN_NAMES = {"JOSE","JOSÉ","LUIS","MARIA","MARÍA","ANTONIO","MANUEL","ANA","JUAN","CARLOS","PABLO","ROGELIO","FRANCISCO","MARTA","ELENA","LAURA","JOSÉ","LUÍS"}
+GIVEN_NAMES = {
+    "JOSE","JOSÉ","LUIS","MARIA","MARÍA","ANTONIO","MANUEL","ANA","JUAN","CARLOS","PABLO",
+    "ROGELIO","FRANCISCO","MARTA","ELENA","LAURA","JULIO","RAMON","RAMÓN","RAFAEL","SERGIO"
+}
 # Permitir ampliar vía entorno: GIVEN_NAMES_EXTRA="PABLO|LUISA|..."
 _gn_extra = os.getenv("GIVEN_NAMES_EXTRA", "").strip()
 if _gn_extra:
@@ -322,10 +325,15 @@ def clean_candidate_text(s: str) -> str:
         if ch in up:
             return ""
     STOP = {
-        "DATOS","ESCALA","LEYENDA","MAPA","COORDENADAS","COORD","REFERENCIA","CATASTRAL",
-        "PARCELA","POLIGONO","POLÍGONO","HOJA","AHORA","NORTE","SUR","ESTE","OESTE",
-        "TITULARIDAD","PRINCIPAL","TITULAR","SECUNDARIA"
-    }
+    # rótulos generales de plano/tabla
+    "DATOS","ESCALA","LEYENDA","MAPA","COORDENADAS","COORD","REFERENCIA","CATASTRAL",
+    # parcela/polígono y variantes abreviadas
+    "PARCELA","PARCELAS","PARCELARIO","PARC","POLIGONO","POLÍGONO","HOJA",
+    # listados y cabeceras frecuentes en catastro
+    "RELACION","RELACIÓN","LISTADO","LISTA","RELACIÓN DE","RELACION DE",
+    # otros rótulos administrativos
+    "Nº","NO","NUM","NUM.","CODIGO","CÓDIGO","POSTAL","CP"
+}
     if any(kw in up for kw in STOP):
         return ""
 
@@ -1323,10 +1331,6 @@ def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
-
-
-
-
 
 
 
