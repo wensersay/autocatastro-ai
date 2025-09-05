@@ -80,6 +80,10 @@ class Cfg:
 
     owner_allow_digits: bool = os.getenv("OWNER_ALLOW_DIGITS", "0") == "1"
 
+    # Snaps específicos para asignación basada en filas (row)
+    row_angle_snap_deg: float = float(os.getenv("ROW_ANGLE_SNAP_DEG", "30"))
+    row_card_dom_factor: float = float(os.getenv("ROW_CARD_DOM_FACTOR", "1.07"))
+
     angle_snap_deg: float = float(os.getenv("ANGLE_SNAP_DEG", "24"))
 
     # Cobertura mínima en cardinal para hacer snap desde diagonal por ángulo
@@ -790,19 +794,29 @@ def _extract_owner_from_row(bgr: np.ndarray, row_y: int, lines: int = 2) -> Tupl
             rgb = cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
             lines_data = ocr_image_to_data_lines(rgb)
             if lines_data:
-                k = min(3, len(lines_data))
-                parts: List[str] = []
-                for j in range(k):
-                    seg = (lines_data[j][0] or "").strip()
-                    if not seg:
-                        continue
-                    if j == 0 or (len(seg) <= CFG.second_line_maxchars and len(seg.split()) <= CFG.second_line_maxtokens):
-                        parts.append(seg)
-                if parts:
-                    joined = " ".join(parts)
-                    owner = _pick_owner_from_text(joined)
-                    if not owner:
-                        owner = _pick_owner_from_text(reorder_surname_first(joined))
+                # Candidatos: L1, L1+L2, L1+L2+L3 (si son cortas)
+                segs = [(lines_data[j][0] or "").strip() for j in range(min(3, len(lines_data)))]
+                variants = []
+                if segs and segs[0]:
+                    variants.append(segs[0])
+                    if len(segs) >= 2 and len(segs[1]) <= CFG.second_line_maxchars and len(segs[1].split()) <= CFG.second_line_maxtokens:
+                        variants.append(segs[0] + " " + segs[1])
+                    if len(segs) >= 3 and len(segs[2]) <= CFG.second_line_maxchars and len(segs[2].split()) <= CFG.second_line_maxtokens:
+                        variants.append(segs[0] + " " + segs[1] + " " + segs[2])
+                # Puntuar por nº tokens útiles (máx) y longitud
+                def _score_name(s: str) -> Tuple[int,int]:
+                    t = clean_candidate_text(postprocess_name(s))
+                    return (len(t.split()), len(t))
+                best_txt, best_sc = "", (-1,-1)
+                for v in variants:
+                    cand = _pick_owner_from_text(v)
+                    if not cand:
+                        cand = _pick_owner_from_text(reorder_surname_first(v))
+                    t = clean_candidate_text(postprocess_name(cand)) if cand else ""
+                    sc = (len(t.split()), len(t))
+                    if sc > best_sc:
+                        best_sc, best_txt = sc, t
+                owner = best_txt or owner
         owner = clean_candidate_text(postprocess_name(owner))
         attempts.append((attempt, x0,y0,x1,y1, owner))
         if owner and len(owner) >= 6:
@@ -817,9 +831,9 @@ def detect_rows_and_extract8(bgr: np.ndarray) -> Tuple[Dict[str,List[str]], dict
     left = int(w * 0.06); right = int(w * 0.40)
     crop = bgr[top:bottom, left:right]
     # colores
-    def _centroids(mask: np.ndarray, min_area: int) -> List[Tuple[int,int,int]]:
+    def _centroids(mask: np.ndarray, min_area: int):
         cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        out: List[Tuple[int,int,int]] = []
+        out = []
         for c in cnts:
             a = cv2.contourArea(c)
             if a < min_area: continue
@@ -859,13 +873,36 @@ def detect_rows_and_extract8(bgr: np.ndarray) -> Tuple[Dict[str,List[str]], dict
             if d < best_d:
                 best_d = d; best = (nx, ny)
         side = ""
+        snapped_to = None
+        row_angle = None
         if best is not None and best_d < (w*0.28)**2:
             side = side_of((mcx, mcy), best)
+            # snap de diagonal a cardinal según geometría row (sin cobertura)
+            dx, dy = best[0]-mcx, best[1]-mcy
+            row_angle = (math.degrees(math.atan2(-(dy), dx)) + 360.0) % 360.0
+            if side in ("noreste","noroeste","suroeste","sureste"):
+                # criterio 1: dominancia horizontal/vertical
+                ax, ay = abs(dx), abs(dy)
+                f = CFG.row_card_dom_factor
+                if ax >= ay * f:
+                    snapped_to = "este" if dx > 0 else "oeste"
+                elif ay >= ax * f:
+                    snapped_to = "sur" if dy > 0 else "norte"
+                # criterio 2: cercanía angular a cardinal
+                if not snapped_to:
+                    centers = {"este":0.0, "norte":90.0, "oeste":180.0, "sur":270.0}
+                    def _angdist(a,b):
+                        d = abs((a-b) % 360.0); return min(d, 360.0-d)
+                    cand = min(centers.items(), key=lambda kv: _angdist(row_angle, kv[1]))[0]
+                    if _angdist(row_angle, centers[cand]) <= CFG.row_angle_snap_deg:
+                        snapped_to = cand
+                if snapped_to:
+                    side = snapped_to
         owner, _roi, attempt_id = _extract_owner_from_row(bgr, row_y=mcy, lines=max(1, CFG.row_owner_lines))
         if side and owner:
             if owner not in ldr[side]:
                 ldr[side].append(owner); used_rows += 1
-        rows_dbg.append({"row_y": mcy, "main_center": [mcx, mcy], "neigh_center": list(best) if best else None, "side": side, "owner": owner, "roi_attempt": attempt_id})
+        rows_dbg.append({"row_y": mcy, "main_center": [mcx, mcy], "neigh_center": list(best) if best else None, "side": side, "owner": owner, "roi_attempt": attempt_id, "row_angle": row_angle, "snapped_to": snapped_to})"row_y": mcy, "main_center": [mcx, mcy], "neigh_center": list(best) if best else None, "side": side, "owner": owner, "roi_attempt": attempt_id})
     return ldr, {"rows": rows_dbg, "used_rows": used_rows}
 
 # ----------------------------------------
@@ -1091,7 +1128,6 @@ def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
-
 
 
 
