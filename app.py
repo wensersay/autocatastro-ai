@@ -803,6 +803,27 @@ def _extract_owner_from_row(bgr: np.ndarray, row_y: int, lines: int = 2) -> Tupl
                         variants.append(segs[0] + " " + segs[1])
                     if len(segs) >= 3 and len(segs[2]) <= CFG.second_line_maxchars and len(segs[2].split()) <= CFG.second_line_maxtokens:
                         variants.append(segs[0] + " " + segs[1] + " " + segs[2])
+
+                    # NUEVO: si L2/L3 son 1–2 tokens y parecen nombres propios, añadirlos al final de L1
+                    extra_given: list[str] = []
+                    for j in (1, 2):
+                        if j < len(segs) and segs[j]:
+                            toksj = [t for t in segs[j].split() if t]
+                            if 1 <= len(toksj) <= 2:
+                                buf: list[str] = []
+                                all_given = True
+                                for t in toksj:
+                                    up = strip_accents(t).upper()
+                                    if up in GIVEN_NAMES:
+                                        buf.append(t)
+                                    else:
+                                        all_given = False
+                                        break
+                                if all_given:
+                                    extra_given.extend(buf)
+                    if extra_given:
+                        variants.append(segs[0] + " " + " ".join(extra_given))
+
                 # Puntuar por nº tokens útiles (máx) y longitud
                 def _score_name(s: str) -> Tuple[int,int]:
                     t = clean_candidate_text(postprocess_name(s))
@@ -1128,6 +1149,7 @@ def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
+
 
 
 
