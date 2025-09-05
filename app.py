@@ -822,7 +822,18 @@ def _extract_owner_from_row(bgr: np.ndarray, row_y: int, lines: int = 2) -> Tupl
                                 if all_given:
                                     extra_given.extend(buf)
                     if extra_given:
-                        variants.append(segs[0] + " " + " ".join(extra_given))
+                        # Insertar nombres propios extra INMEDIATAMENTE tras los nombres de pila de L1
+                        base_tokens = [t for t in segs[0].split() if t]
+                        i = 0
+                        while i < len(base_tokens) and strip_accents(base_tokens[i]).upper() in GIVEN_NAMES:
+                            i += 1
+                        prefix = base_tokens[:i]
+                        rest = base_tokens[i:]
+                        # Evitar duplicar nombres ya presentes en el prefijo
+                        pref_set = {strip_accents(t).upper() for t in prefix}
+                        extra_clean = [t for t in extra_given if strip_accents(t).upper() not in pref_set]
+                        merged = prefix + extra_clean + rest
+                        variants.append(" ".join(merged))
 
                 # Puntuar por nº tokens útiles (máx) y longitud
                 def _score_name(s: str) -> Tuple[int,int]:
@@ -1149,7 +1160,6 @@ def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
-
 
 
 
