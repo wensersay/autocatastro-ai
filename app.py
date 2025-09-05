@@ -63,6 +63,7 @@ class Cfg:
     second_line_maxchars: int = int(os.getenv("SECOND_LINE_MAXCHARS", "64"))
     second_line_maxtokens: int = int(os.getenv("SECOND_LINE_MAXTOKENS", "14"))
     second_line_scan_extra_pct: float = float(os.getenv("SECOND_LINE_SCAN_EXTRA_PCT", "0.03"))  # mini‑tweak: escaneo bajo la banda
+    second_line_scan_max_pct: float = float(os.getenv("SECOND_LINE_SCAN_MAX_PCT", "0.06"))  # límite superior del escaneo escalonado
 
     neigh_min_area_hard: int = int(os.getenv("NEIGH_MIN_AREA_HARD", "600"))
     neigh_max_dist_ratio: float = float(os.getenv("NEIGH_MAX_DIST_RATIO", "1.8"))
@@ -179,6 +180,13 @@ ACCENT_MAP = {
     "SANCHEZ": "Sánchez", "SAVINAO": "Saviñao", "MUNOZ": "Muñoz", "LUISA": "Luisa"
 }
 GIVEN_NAMES = {"JOSE","JOSÉ","LUIS","MARIA","MARÍA","ANTONIO","MANUEL","ANA","JUAN","CARLOS","PABLO","ROGELIO","FRANCISCO","MARTA","ELENA","LAURA","JOSÉ","LUÍS"}
+# Permitir ampliar vía entorno: GIVEN_NAMES_EXTRA="PABLO|LUISA|..."
+_gn_extra = os.getenv("GIVEN_NAMES_EXTRA", "").strip()
+if _gn_extra:
+    for _tok in _gn_extra.split("|"):
+        _t = _tok.strip()
+        if _t:
+            GIVEN_NAMES.add(strip_accents(_t).upper())
 UPPER_NAME_RE = re.compile(r"^[A-ZÁÉÍÓÚÜÑ][A-ZÁÉÍÓÚÜÑ\s\.'\-]+$", re.UNICODE)
 BAD_TOKENS = {"POLÍGONO","POLIGONO","PARCELA","APELLIDOS","NOMBRE","RAZON","RAZÓN","SOCIAL","NIF","DOMICILIO","LOCALIZACIÓN","LOCALIZACION","REFERENCIA","CATASTRAL","TITULARIDAD","PRINCIPAL"}
 GEO_TOKENS = {"LUGO","BARCELONA","MADRID","VALENCIA","SEVILLA","CORUÑA","A CORUÑA","MONFORTE","LEM","LEMOS","HOSPITALET","L'HOSPITALET","SAVIAO","SAVIÑAO","GALICIA","[LUGO]","[BARCELONA]"}
@@ -803,32 +811,54 @@ def _extract_owner_from_row(bgr: np.ndarray, row_y: int, lines: int = 2) -> Tupl
                     # NUEVO: si L2/L3 son 1–2 tokens y parecen nombres propios, añadirlos al final de L1
                     extra_given: list[str] = []
                     # Si no se detecta en L2/L3, probar una micro‑banda por debajo del ROI (por si L2 quedó fuera)
-                    if CFG.second_line_scan_extra_pct > 0 and not extra_given:
-                        y0b = min(h - 1, y1 + 1)
-                        y1b = min(h, y1 + max(int(h * CFG.second_line_scan_extra_pct), max(24, int((y1 - y0) * 0.5))))
-                        if y1b > y0b:
+                    # Escaneo escalonado por debajo del ROI para capturar L2 si quedó fuera
+                    if not extra_given and CFG.second_line_scan_extra_pct > 0:
+                        spans = []
+                        base = max(0.0, float(CFG.second_line_scan_extra_pct))
+                        top  = max(base, float(getattr(CFG, "second_line_scan_max_pct", 0.06)))
+                        mid  = (base + top) / 2.0
+                        for pct in [base, mid, top]:
+                            if pct not in spans:
+                                spans.append(pct)
+                        for pct in spans:
+                            y0b = min(h - 1, y1 + 1)
+                            y1b = min(h, y0b + max(int(h * pct), max(24, int((y1 - y0) * 0.5))))
+                            if y1b <= y0b:
+                                continue
                             roi_below = bgr[y0b:y1b, x0:x1]
-                            if roi_below.size > 0:
-                                gg = cv2.cvtColor(roi_below, cv2.COLOR_BGR2GRAY)
-                                gg = cv2.resize(gg, None, fx=1.35, fy=1.35, interpolation=cv2.INTER_CUBIC)
-                                gg = _enhance_gray(gg)
-                                bw2, bwi2 = _binarize(gg)
-                                WL2 = "ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÜÑabcdefghijklmnopqrstuvwxyzáéíóúüñ '"
-                                cand_below = _ocr_text(bw2, 6, WL2)
-                                if not cand_below:
-                                    cand_below = _ocr_text(bwi2, 6, WL2)
-                                cand_below = postprocess_name(cand_below)
-                                tokb = [t for t in cand_below.split() if t]
-                                # tomar 1–2 tokens iniciales si son nombres propios
-                                buf2: list[str] = []
-                                for t in tokb[:2]:
-                                    up = strip_accents(t).upper()
-                                    if up in GIVEN_NAMES:
-                                        buf2.append(t)
-                                    else:
+                            if roi_below.size == 0:
+                                continue
+                            gg = cv2.cvtColor(roi_below, cv2.COLOR_BGR2GRAY)
+                            gg = cv2.resize(gg, None, fx=1.35, fy=1.35, interpolation=cv2.INTER_CUBIC)
+                            gg = _enhance_gray(gg)
+                            # Usar líneas para capturar 'Pablo' incluso si aparece solo en una línea
+                            lines_below = ocr_image_to_data_lines(cv2.cvtColor(gg, cv2.COLOR_GRAY2BGR))
+                            taken: list[str] = []
+                            for (tline, _lbbox) in lines_below[:3]:
+                            cand = postprocess_name(tline)
+                            toks = [t for t in cand.split() if t]
+                            buf: list[str] = []
+                            # Preferencia: 1–2 nombres propios conocidos
+                            for t in toks[:2]:
+                                up = strip_accents(t).upper()
+                                if up in GIVEN_NAMES:
+                                    buf.append(t)
+                                else:
+                                    break
+                            if 1 <= len(buf) <= 2:
+                                taken = buf
+                                break
+                            # Fallback: primer token alfabético Capitalizado que no sea conector (DE/DEL/…)
+                            if not taken and toks:
+                                for t in toks[:2]:
+                                    raw = t.strip(".,;:()[]{}")
+                                    up = strip_accents(raw).upper()
+                                    if re.match(r"^[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]{2,14}$", raw) and up not in NAME_CONNECTORS:
+                                        taken = [propercase_spanish(raw)]
                                         break
-                                if 1 <= len(buf2) <= 2:
-                                    extra_given.extend(buf2)
+                            if taken:
+                                extra_given.extend(taken)
+                                break
                     for j in (1, 2):
                         if j < len(segs) and segs[j]:
                             toksj = [t for t in segs[j].split() if t]
@@ -856,7 +886,7 @@ def _extract_owner_from_row(bgr: np.ndarray, row_y: int, lines: int = 2) -> Tupl
                         pref_set = {strip_accents(t).upper() for t in prefix}
                         extra_clean = [t for t in extra_given if strip_accents(t).upper() not in pref_set]
                         merged = prefix + extra_clean + rest
-                        variants.append(" ".join(merged))
+                        variants.insert(0, " ".join(merged))
 
                         # Variante B: reordenar L1 primero (apellidos→final) y luego insertar tras los nombres de pila
                         l1_reord = reorder_surname_first(segs[0])
@@ -869,7 +899,7 @@ def _extract_owner_from_row(bgr: np.ndarray, row_y: int, lines: int = 2) -> Tupl
                         pref_set2 = {strip_accents(t).upper() for t in prefix2}
                         extra_clean2 = [t for t in extra_given if strip_accents(t).upper() not in pref_set2]
                         merged2 = prefix2 + extra_clean2 + rest2
-                        variants.append(" ".join(merged2))
+                        variants.insert(0, " ".join(merged2))
 
                 # Puntuar por nº tokens útiles (máx) y longitud
                 def _score_name(s: str) -> Tuple[int,int]:
