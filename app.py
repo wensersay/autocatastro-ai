@@ -60,8 +60,8 @@ class Cfg:
     name_hints_file: Optional[str] = os.getenv("NAME_HINTS_FILE")
 
     second_line_force: bool = os.getenv("SECOND_LINE_FORCE", "1") == "1"
-    second_line_maxchars: int = int(os.getenv("SECOND_LINE_MAXCHARS", "40"))
-    second_line_maxtokens: int = int(os.getenv("SECOND_LINE_MAXTOKENS", "8"))
+    second_line_maxchars: int = int(os.getenv("SECOND_LINE_MAXCHARS", "48"))
+    second_line_maxtokens: int = int(os.getenv("SECOND_LINE_MAXTOKENS", "10"))
 
     neigh_min_area_hard: int = int(os.getenv("NEIGH_MIN_AREA_HARD", "600"))
     neigh_max_dist_ratio: float = float(os.getenv("NEIGH_MAX_DIST_RATIO", "1.8"))
@@ -71,10 +71,10 @@ class Cfg:
     propercase: bool = os.getenv("PROPERCASE", "1") == "1"
 
     sector_assign_mode: str = os.getenv("SECTOR_ASSIGN_MODE", "smart")
-    diag_keep_dominance: float = float(os.getenv("DIAG_KEEP_DOMINANCE", "0.55"))
-    card_pair_min_each: float = float(os.getenv("CARD_PAIR_MIN_EACH", "0.20"))
+    diag_keep_dominance: float = float(os.getenv("DIAG_KEEP_DOMINANCE", "0.60"))
+    card_pair_min_each: float = float(os.getenv("CARD_PAIR_MIN_EACH", "0.24"))
     card_pair_min_combined: float = float(os.getenv("CARD_PAIR_MIN_COMBINED", "0.50"))
-    card_single_min: float = float(os.getenv("CARD_SINGLE_MIN", "0.30"))
+    card_single_min: float = float(os.getenv("CARD_SINGLE_MIN", "0.28"))
 
     diag_to_cardinals: bool = os.getenv("DIAG_TO_CARDINALS", "0") == "1"
 
@@ -165,7 +165,8 @@ LOWER_CONNECTORS = {"de","del","la","las","los","y","da","do","das","dos"}
 ACCENT_MAP = {
     "JOSE": "José", "RODRIGUEZ": "Rodríguez", "ALVAREZ": "Álvarez", "LOPEZ": "López",
     "FERNANDEZ": "Fernández", "VAZQUEZ": "Vázquez", "MARTIN": "Martín", "MARTINEZ": "Martínez",
-    "PEREZ": "Pérez", "GOMEZ": "Gómez", "GARCIA": "García", "NUNEZ": "Núñez", "MARIA": "María"
+    "PEREZ": "Pérez", "GOMEZ": "Gómez", "GARCIA": "García", "NUNEZ": "Núñez", "MARIA": "María",
+    "SANCHEZ": "Sánchez", "SAVINAO": "Saviñao", "MUNOZ": "Muñoz", "LUISA": "Luisa"
 }
 GIVEN_NAMES = {"JOSE","JOSÉ","LUIS","MARIA","MARÍA","ANTONIO","MANUEL","ANA","JUAN","CARLOS","PABLO","ROGELIO","FRANCISCO","MARTA","ELENA","LAURA","JOSÉ","LUÍS"}
 UPPER_NAME_RE = re.compile(r"^[A-ZÁÉÍÓÚÜÑ][A-ZÁÉÍÓÚÜÑ\s\.'\-]+$", re.UNICODE)
@@ -198,12 +199,38 @@ def propercase_spanish(s: str) -> str:
 
 
 def reorder_surname_first(s: str) -> str:
-    toks = s.split()
-    if len(toks) >= 2:
-        last = strip_accents(toks[-1]).upper()
-        if last in GIVEN_NAMES:
-            return toks[-1] + " " + " ".join(toks[:-1])
-    return s
+    """
+    Si el/los nombres propios están al final (1 o 2 tokens), muévelos delante.
+    Ej.: 'Lopez Lopez Maria Luisa' → 'María Luisa López López'
+         'Pombo Sanchez Sergio'   → 'Sergio Pombo Sánchez'
+    """
+    if not s:
+        return s
+    toks = [t for t in re.split(r"\s+", s.strip()) if t]
+    if len(toks) < 2:
+        return s
+
+    norm = [strip_accents(t).upper() for t in toks]
+    GIVEN = {
+        "JOSE","JOSÉ","JUAN","PABLO","LUIS","LUISA","MARIA","MARÍA",
+        "SERGIO","ELENA","ANTONIO","MANUEL","CARLOS","ANA","LAURA","MARTA"
+    }
+
+    tail = 0
+    i = len(toks) - 1
+    while i >= 0 and tail < 2 and norm[i] in GIVEN:
+        tail += 1
+        i -= 1
+
+    if tail == 0:
+        return s
+
+    names_tail = toks[-tail:]
+    surnames   = toks[:-tail]
+
+    out = names_tail + surnames
+    pretty = propercase_spanish(" ".join(out))
+    return pretty
 
 
 def postprocess_name(text: str) -> str:
@@ -264,7 +291,8 @@ def clean_candidate_text(s: str) -> str:
     up = strip_accents(s).upper()
 
     # 3) Defensa frente a símbolos / rótulos
-    for ch in ["=", "*", "_", "/", "\\", "|", "[", "]", "{", "}", "<", ">"]:
+    SYMBOLS_BLOCK = ["=", "*", "_", "/", "\", "|", "[", "]", "{", "}", "<", ">"]
+    for ch in SYMBOLS_BLOCK:
         if ch in up:
             return ""
     STOP = {
@@ -481,42 +509,50 @@ def sector_coverage(subj_c: Tuple[int,int], contour: np.ndarray, step: int = 8) 
 
 
 def decide_sides_smart(cov: Dict[str, float]) -> List[str]:
-    # 1) Si ambos cardinales contiguos superan umbral, asignar ambos
+    """Decisión de lados con preferencia a cardinal cuando domina.
+    - Si ambos cardinales de una diagonal están bien presentes → pareja.
+    - Si una diagonal es débil o un cardinal domina claramente → ese cardinal.
+    - Si un cardinal supera el umbral y es el mejor → ese cardinal.
+    - Último recurso: el mejor lado bruto.
+    """
+    # 1) Pareja de cardinales fuerte
     for diag, (a, b) in PAIRS.items():
-        if cov[a] >= CFG.card_pair_min_each and cov[b] >= CFG.card_pair_min_each and (cov[a] + cov[b]) >= CFG.card_pair_min_combined:
+        if (
+            cov[a] >= CFG.card_pair_min_each
+            and cov[b] >= CFG.card_pair_min_each
+            and (cov[a] + cov[b]) >= CFG.card_pair_min_combined
+        ):
             return [a, b]
 
-    # 2) Mejor lado por cobertura bruta
+    # 2) Mejor lado bruto
     best_side = max(SIDES8, key=lambda s: cov.get(s, 0.0))
+    best_val  = cov.get(best_side, 0.0)
 
-    # 3) Mantener diagonal solo si es realmente dominante
+    # 3) Snap-to-cardinal si la diagonal no domina o un cardinal domina claramente
+    CARD_DOM_FACTOR = 1.20    # ~20% mayor que el otro
+    DIAG_WEAK_MAX   = 0.42    # diagonal débil
+
     if best_side in PAIRS:
         a, b = PAIRS[best_side]
-        if cov[best_side] >= CFG.diag_keep_dominance and cov[a] < CFG.card_pair_min_each and cov[b] < CFG.card_pair_min_each:
-            return [best_side]
+        a_v, b_v = cov.get(a, 0.0), cov.get(b, 0.0)
+        if (
+            best_val < DIAG_WEAK_MAX
+            or (a_v >= CFG.card_single_min and a_v >= b_v * CARD_DOM_FACTOR)
+            or (b_v >= CFG.card_single_min and b_v >= a_v * CARD_DOM_FACTOR)
+        ):
+            if a_v >= b_v and a_v >= CFG.card_single_min:
+                return [a]
+            if b_v >  a_v and b_v >= CFG.card_single_min:
+                return [b]
 
-    # 4) Si una pareja cardinal suma fuerte y cada uno pasa mínimo, usar pareja
-    card_pairs = [("norte","este"),("este","sur"),("sur","oeste"),("oeste","norte")]
-    best_pair: Optional[Tuple[str,str]] = None
-    best_sum = 0.0
-    for a,b in card_pairs:
-        s = cov[a] + cov[b]
-        if cov[a] >= CFG.card_single_min and cov[b] >= CFG.card_single_min and s > best_sum:
-            best_sum = s; best_pair = (a,b)
-    if best_pair:
-        return list(best_pair)
+    # 4) Cardinal fuerte y además mejor
+    for c in ("este","sur","oeste","norte"):
+        if cov.get(c, 0.0) >= CFG.card_single_min and c == best_side:
+            return [c]
 
-    # 5) Democión de diagonal con ventaja débil hacia el cardinal dominante
-    if best_side in PAIRS:
-        a, b = PAIRS[best_side]
-        if cov[best_side] < CFG.diag_keep_dominance:
-            # elegir el cardinal más fuerte si pasa el mínimo individual
-            best_card, best_val = (a, cov[a]) if cov[a] >= cov[b] else (b, cov[b])
-            if best_val >= CFG.card_single_min:
-                return [best_card]
-
-    # 6) En última instancia, devolver el mejor lado bruto
+    # 5) Último recurso
     return [best_side]
+
 # ----------------------------------------
 # OCR cerca del vecino (fallback)
 # ----------------------------------------
